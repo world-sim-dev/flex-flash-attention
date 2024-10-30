@@ -46,10 +46,13 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     >>;
     // using Scheduler = flash::SingleTileScheduler;
     Seqlen_traits_Q seqlen_traits_q(
-        params.total_q, params.seqlen_q, params.cu_seqlens_q, params.seqused_q);
+        params.total_q, params.seqlen_q, params.cu_seqlens_q, params.seqused_q, params.q_ranges);
     Seqlen_traits seqlen_traits_k(
-        params.total_k, params.seqlen_k, params.cu_seqlens_k, params.seqused_k);
+        params.total_k, params.seqlen_k, params.cu_seqlens_k, params.seqused_k, params.k_ranges);
 
+    std::cout << "q_gem_layout, " << "seqlen_q = " << params.seqlen_q << ", d = " << params.d << ", h_k = " << params.h_k << ", b = " << params.b << ", h_h_k_ratio = " << params.h_h_k_ratio << ", q_row_stride = " << params.q_row_stride << ", q_head_stride = " << params.q_head_stride << ", q_batch_stride = " << params.q_batch_stride << std::endl;
+    std::cout << "k_gem_layout, " << "seqlen_k = " << params.seqlen_k << ", d = " << params.d << ", h_k = " << params.h_k << ", b_k = " << params.b_k << ", k_row_stride = " << params.k_row_stride << ", k_head_stride = " << params.k_head_stride << ", k_batch_stride = " << params.k_batch_stride << std::endl;
+    std::cout << "v_gem_layout, " << "seqlen_k = " << params.seqlen_k << ", d = " << params.d << ", h_k = " << params.h_k << ", b_k = " << params.b_k << ", v_row_stride = " << params.v_row_stride << ", v_head_stride = " << params.v_head_stride << ", v_batch_stride = " << params.v_batch_stride << std::endl;
     typename CollectiveMainloop::Params mainloop_params =
         CollectiveMainloop::to_underlying_arguments({
             static_cast<Element const*>(params.q_ptr),            
@@ -111,7 +114,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     int num_blocks_h = params.h_k * ceil_div(params.h_h_k_ratio, Kernel_traits::kBlockH);
     typename Scheduler::Arguments scheduler_args =
         {num_blocks_m, Is_split ? params.num_splits : 1, num_blocks_h, params.b, params.tile_count_semaphore};
-    typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);    
+    typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
+
+    std::cout << "num_blocks_m = " << num_blocks_m << ", num_blocks_h = " << num_blocks_h << std::endl;    
 
     // Get the ptr to kernel function.
     void *kernel;
@@ -196,7 +201,7 @@ void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
       BOOL_SWITCH(params.is_local, Is_local, [&] {
         MMA_3WG_SWITCH(params.seqlen_q, kNumMmaWGs, [&] {
-          SEQLEN_SWITCH(params.cu_seqlens_q, Seqlen_traits, [&] {
+          SEQLEN_SWITCH(params.cu_seqlens_q, params.q_ranges, Seqlen_traits, [&] {
             BOOL_SWITCH(params.num_splits > 1, Is_split, [&] {
               // BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, 192) % 2 == 0 && !Is_causal && !Is_local && !Is_split
               //             && kNumMmaWGs == 3 && !Seqlen_traits::UseVarSeqLen, UseCluster, [&] {
@@ -222,7 +227,7 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
     MMA_2WG_SWITCH(params.seqlen_q, kNumMmaWGs, [&] {
       BOOL_SWITCH(params.is_causal, Is_causal, [&] {
         BOOL_SWITCH(params.is_local, Is_local, [&] {
-          SEQLEN_SWITCH(params.cu_seqlens_q, Seqlen_traits, [&] {
+          SEQLEN_SWITCH(params.cu_seqlens_q, params.q_ranges, Seqlen_traits, [&] {
             BOOL_SWITCH(params.num_splits > 1, Is_split, [&] {
               // Only use Cluster if number of tiles along seqlen_q is even
               // and not Is_causal, Is_split, or varseqlen
@@ -253,7 +258,7 @@ void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
     MMA_2WG_SWITCH(params.seqlen_q, kNumMmaWGs, [&] {
       BOOL_SWITCH(params.is_causal, Is_causal, [&] {
         BOOL_SWITCH(params.is_local, Is_local, [&] {
-          SEQLEN_SWITCH(params.cu_seqlens_q, Seqlen_traits, [&] {
+          SEQLEN_SWITCH(params.cu_seqlens_q, params.q_ranges, Seqlen_traits, [&] {
             BOOL_SWITCH(params.num_splits > 1, Is_split, [&] {
               // Only use Cluster if number of tiles along seqlen_q is even
               // and not Is_causal, Is_split, or varseqlen

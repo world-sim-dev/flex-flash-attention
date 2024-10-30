@@ -75,6 +75,11 @@ struct Flash_fwd_params : public Qkv_params {
     int * __restrict__ cu_seqlens_q;
     int * __restrict__ cu_seqlens_k;
 
+    // array of length b holding the starting index and ending index of each sequence.
+    // only used for flex flash attention.
+    int * __restrict__ q_ranges;
+    int * __restrict__ k_ranges;
+
     // If provided, the actual length of each q / o sequence.
     int * __restrict__ seqused_q;
     // If provided, the actual length of each k / v sequence.

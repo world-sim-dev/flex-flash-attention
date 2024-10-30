@@ -162,6 +162,26 @@ def _flash_attn_varlen_backward(
     return dq, dk, dv, softmax_d
 
 
+def _flex_flash_attn_forward(q, k, v, q_ranges, k_ranges, max_seqlen_q, max_seqlen_k, softmax_scale, deterministic):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    out, q, k, v, out_padded, softmax_lse = flashattn_hopper_cuda.flex_flash_fwd(
+        q,
+        k,
+        v,
+        None,
+        q_ranges,
+        k_ranges,
+        max_seqlen_q,
+        max_seqlen_k, 
+        softmax_scale,
+        deterministic
+    )
+    return out, q, k, v, out_padded, softmax_lse
+
+
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -628,3 +648,5 @@ def flash_attn_with_kvcache(
         gqa_parallel
     )
     return (out, softmax_lse) if return_softmax_lse else out
+
+
