@@ -338,9 +338,9 @@ struct CollectiveMainloopFwd {
             }
         }();
         Tensor gK = seqlen_traits_k.get_local_tile_tensor(
-            mK, select<1, 2>(TileShape_MNK{}), bidh_kv, bidb_cache, false, true);  // (N, K, _)
+            mK, select<1, 2>(TileShape_MNK{}), bidh_kv, bidb_cache);  // (N, K, _)
         Tensor gV = seqlen_traits_k.get_local_tile_tensor(
-            mV, select<1, 2>(TileShape_MNK{}), bidh_kv, bidb_cache, false, true);  // (N, K, _)
+            mV, select<1, 2>(TileShape_MNK{}), bidh_kv, bidb_cache);  // (N, K, _)
 
         Tensor sQ_x = make_tensor(sQ.data(), make_layout(sQ.layout(), Layout<_1>{}));
         Tensor gQ_x = make_tensor(gQ.data(), make_layout(gQ.layout(), Layout<_1>{}));
@@ -475,9 +475,9 @@ struct CollectiveMainloopFwd {
             }
         }();
         Tensor gK = seqlen_traits_k.get_local_tile_tensor(
-            mK, select<1, 2>(TileShape_MNK{}), bidh_kv, bidb_cache, false, true);  // (N, K, _)
+            mK, select<1, 2>(TileShape_MNK{}), bidh_kv, bidb_cache);  // (N, K, _)
         Tensor gV = seqlen_traits_k.get_local_tile_tensor(
-            mV, select<1, 2>(TileShape_MNK{}), bidh_kv, bidb_cache, false, true);  // (N, K, _)
+            mV, select<1, 2>(TileShape_MNK{}), bidh_kv, bidb_cache);  // (N, K, _)
 
         Tensor sQ_x = make_tensor(sQ.data(), make_layout(sQ.layout(), Layout<_1>{}));
         Tensor gQ_x = make_tensor(gQ.data(), make_layout(gQ.layout(), Layout<_1>{}));

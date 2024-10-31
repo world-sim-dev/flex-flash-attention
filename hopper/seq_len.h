@@ -96,9 +96,8 @@ public:
       int sum_s, int max_seq_len, int *cu_seq_len = nullptr, int *seq_used = nullptr, int *seq_ranges = nullptr): 
       sum_s(sum_s), cu_seq_len(cu_seq_len), seq_used(seq_used), seq_ranges(seq_ranges), actual_seq_len(max_seq_len) {}
 
-  CUTLASS_DEVICE void init(int bidb, bool is_kv=false) {
+  CUTLASS_DEVICE void init(int bidb) {
     // TODO: add leftpad, seqlen_new for kv cache support
-    assert(is_kv == false);
     if (seq_used) {
       actual_seq_len = seq_used[bidb];
     }
@@ -174,8 +173,7 @@ public:
   template <typename MTensor, typename Shape>
   CUTLASS_DEVICE auto get_local_tile_tensor(
       const MTensor &m_tensor, const Shape &tile_shape, 
-      int bidh, int bidb, bool padded = false, bool is_kv = false) const {
-    assert(is_kv == false);
+      int bidh, int bidb, bool padded = false) const {
     auto g_tensor = local_tile(
       m_tensor(_, _, bidh, bidb), tile_shape, make_coord(_, _0{}));
     return g_tensor;
@@ -224,25 +222,18 @@ using FixedGQASeqLenTraits = SeqLenTraits<false, true, false>;
 using FlexFlashTraits = SeqLenTraits<false, false, true>;
 
 template <>
-CUTLASS_DEVICE void VarSeqLenTraits::init(int bidb, bool is_kv) {
-  if (!is_kv) {
-    actual_seq_len = 
-        seq_used ? seq_used[bidb] : (cu_seq_len[bidb + 1] - cu_seq_len[bidb]);
-  }
-  else{
-    actual_seq_len = 
-        seq_used ? seq_used[bidb] : (cu_seq_len[bidb + 1] - cu_seq_len[0]);
-  }
+CUTLASS_DEVICE void VarSeqLenTraits::init(int bidb) {
+  actual_seq_len = 
+      seq_used ? seq_used[bidb] : (cu_seq_len[bidb + 1] - cu_seq_len[bidb]);
 }
 
 template <>
-CUTLASS_DEVICE void FixedGQASeqLenTraits::init(int bidb, bool is_kv) {
-  assert(is_kv == false);
+CUTLASS_DEVICE void FixedGQASeqLenTraits::init(int bidb) {
   // no op
 }
 
 template <>
-CUTLASS_DEVICE void FlexFlashTraits::init(int bidb, bool is_kv) {
+CUTLASS_DEVICE void FlexFlashTraits::init(int bidb) {
   actual_seq_len = seq_ranges[2 * bidb + 1] - seq_ranges[2 * bidb];
 } 
 
@@ -284,12 +275,11 @@ template <>
 template <typename MTensor, typename Shape>
 CUTLASS_DEVICE auto VarSeqLenTraits::get_local_tile_tensor(
     const MTensor &m_tensor, const Shape &tile_shape,
-    int bidh, int bidb, bool padded, bool is_kv) const {
-  auto st = is_kv ? 0 : bidb;
+    int bidh, int bidb, bool padded) const {
   auto g_offset = local_tile(
       m_tensor(_, _, bidh), 
       cute::make_shape(1, get<1>(tile_shape)), 
-      make_coord(cu_seq_len[st] + (padded ? kMaxTileSize * bidb : 0), _0{}));
+      make_coord(cu_seq_len[bidb] + (padded ? kMaxTileSize * bidb : 0), _0{}));
   auto g_sequence = make_tensor(
       g_offset.data(), 
       make_layout(
@@ -363,11 +353,10 @@ template <>
 template <typename MTensor, typename Shape>
 CUTLASS_DEVICE auto FixedGQASeqLenTraits::get_local_tile_tensor(
     const MTensor &m_tensor, const Shape &tile_shape, 
-    int bidh_kv, int bidb, bool padded, bool is_kv) const {
+    int bidh_kv, int bidb, bool padded) const {
   // m_tensor has shape (M, H/H_K, K, H_K, B)
   // Expect tile_shape (bM/bH, bH, K)
   // Returns g_tensor of shape (bM/bH, bH, K, ceil_div(M,bM/bH), ceil_div(H/H_K,bH))
-  assert(is_kv == false);
   auto g_tensor = local_tile(
       m_tensor(_, _, _, bidh_kv, bidb), tile_shape, make_coord(_, _, _0{}));
   return g_tensor;
@@ -431,7 +420,7 @@ template <>
 template <typename MTensor, typename Shape>
 CUTLASS_DEVICE auto FlexFlashTraits::get_local_tile_tensor(
     const MTensor &m_tensor, const Shape &tile_shape,
-    int bidh, int bidb, bool padded, bool is_kv) const {
+    int bidh, int bidb, bool padded) const {
   auto g_offset = local_tile(
       m_tensor(_, _, bidh), 
       cute::make_shape(1, get<1>(tile_shape)), 

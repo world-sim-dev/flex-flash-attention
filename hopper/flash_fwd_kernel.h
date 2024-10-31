@@ -117,7 +117,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 auto [m_block, n_split_idx, bidh, bidb] = block_coord;
 
                 seqlen_traits_q.init(bidb);
-                seqlen_traits_k.init(bidb, true);
+                seqlen_traits_k.init(bidb);
 
                 if constexpr(seqlen_traits_q.UseVarSeqLen) {
                     // NOTE: to support in future with gqa packed layouts, changed kBlockM to kBlockM/kBlockH
@@ -171,7 +171,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             auto [m_block, n_split_idx, bidh, bidb] = block_coord;
 
             seqlen_traits_q.init(bidb);
-            seqlen_traits_k.init(bidb, true);
+            seqlen_traits_k.init(bidb);
             // printf("m_block = %d, n_split_idx = %d, bidh = %d, bidb = %d\n", m_block, n_split_idx, bidh, bidb);
             // printf("hello, world from blockIdx = %d, actual_seq_len = %d\n", blockIdx.x, seqlen_traits_k.actual_seq_len);
             if constexpr(seqlen_traits_q.UseVarSeqLen) {
