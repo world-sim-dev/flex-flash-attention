@@ -14,6 +14,7 @@ import flashattn_hopper_cuda
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
+
 def _flash_attn_forward(q, k, v, softmax_scale, causal, window_size, descale_q = None, descale_k = None, descale_v = None, gqa_parallel=False):
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, q, k, v, out_padded, softmax_lse, S_dmask = flashattn_hopper_cuda.fwd(
@@ -67,6 +68,7 @@ def _flash_attn_backward(
         deterministic,
     )
     return dq, dk, dv, softmax_d
+
 
 def _flash_attn_varlen_forward(
     q,
@@ -163,8 +165,6 @@ def _flash_attn_varlen_backward(
 
 
 def _flex_flash_attn_forward(q, k, v, q_ranges, k_ranges, max_seqlen_q, max_seqlen_k, softmax_scale, deterministic):
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, q, k, v, out_padded, softmax_lse = flashattn_hopper_cuda.flex_flash_fwd(
@@ -180,6 +180,54 @@ def _flex_flash_attn_forward(q, k, v, q_ranges, k_ranges, max_seqlen_q, max_seql
         deterministic
     )
     return out, q, k, v, out_padded, softmax_lse
+
+
+def _flex_flash_attn_backward(
+    dout,
+    q,
+    k,
+    v,
+    out,
+    softmax_lse,
+    dq,
+    dk,
+    dv,
+    q_ranges,
+    k_ranges,
+    max_seqlen_q,
+    max_seqlen_k,
+    softmax_scale,
+    deterministic=False,
+):
+    maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
+    # dq, dk, dv are allocated by us so they should already be contiguous
+    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    (
+        dq,
+        dk,
+        dv,
+        softmax_d,
+        *rest,
+    ) = flashattn_hopper_cuda.flex_flash_bwd(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dq,
+        dk,
+        dv,
+        q_ranges,
+        k_ranges,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        deterministic,
+    )
+    # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
+    #     breakpoint()
+    return dq, dk, dv, softmax_d
 
 
 class FlashAttnFunc(torch.autograd.Function):
@@ -294,7 +342,17 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
+
+        # Because we're using TMA reduce add for dk and dv, we need to pad the 
+        # batch size to a multiple of 128
+        # k_size = k.size()
+        # k_rounded_size = [(k_size[0] + 128 - 1) // 128 * 128, *k_size[1:]]
+        # v_size = v.size()
+        # v_rounded_size = [(v_size[0] + 128 - 1) // 128 * 128, *v_size[1:]]
+
+        # dq is not padded because we will using dqaccum in cpp code
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    
         _flash_attn_varlen_backward(
             dout,
             q,
@@ -320,6 +378,58 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
+
+
+class FlexFlashAttnFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, q_ranges, k_ranges, max_seqlen_q, max_seqlen_k, softmax_scale, deterministic):
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        out, q, k, v, out_padded, softmax_lse = _flex_flash_attn_forward(
+            q, k, v, q_ranges, k_ranges, max_seqlen_q, max_seqlen_k, softmax_scale, deterministic
+        )
+        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, q_ranges, k_ranges)
+        ctx.max_seqlen_q = max_seqlen_q
+        ctx.max_seqlen_k = max_seqlen_k
+        ctx.softmax_scale = softmax_scale
+        ctx.deterministic = deterministic
+        return out, softmax_lse
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, out, softmax_lse, q_ranges, k_ranges = ctx.saved_tensors
+        
+        # Because we're using TMA reduce add for dk and dv, we need to pad the 
+        # batch size to a multiple of 128
+        # k_size = k.size()
+        # k_rounded_size = [(k_size[0] + 128 - 1) // 128 * 128, *k_size[1:]]
+        # v_size = v.size()
+        # v_rounded_size = [(v_size[0] + 128 - 1) // 128 * 128, *v_size[1:]]
+
+        # dq is not padded because we will using dqaccum in cpp code
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        
+        _flex_flash_attn_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            q_ranges,
+            k_ranges,
+            ctx.max_seqlen_q,
+            ctx.max_seqlen_k,
+            ctx.softmax_scale,
+            ctx.deterministic,
+        )
+        dq = dq[..., : dout.shape[-1]]
+        dk = dk[..., : dout.shape[-1]]
+        dv = dv[..., : dout.shape[-1]]
+        return dq, dk, dv, None, None, None, None, None, None
 
 
 def flash_attn_func(
@@ -470,6 +580,30 @@ def flash_attn_varlen_func(
         deterministic,
         seqused_q,
         seqused_k,
+    )
+
+
+def flex_flash_attn_func(
+    q,
+    k,
+    v,
+    q_ranges,
+    k_ranges,
+    max_seqlen_q,
+    max_seqlen_k,
+    softmax_scale=None,
+    deterministic=False,
+):
+    return FlexFlashAttnFunc.apply(
+        q,
+        k,
+        v,
+        q_ranges,
+        k_ranges,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        deterministic,
     )
 
 

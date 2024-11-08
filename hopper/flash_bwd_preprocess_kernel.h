@@ -86,6 +86,7 @@ public:
         int* dq_semaphore;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        int const* seq_ranges = nullptr;
     };
 
     // Kernel entry point API
@@ -109,6 +110,7 @@ public:
         int* dq_semaphore;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        int const* seq_ranges = nullptr;
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -134,7 +136,8 @@ public:
             args.num_batch,
             args.dq_semaphore,
             args.cu_seqlens,
-            args.seqused
+            args.seqused,
+            args.seq_ranges
         };
     }
 
@@ -149,11 +152,21 @@ public:
         int const bidh = blockIdx.y;
         int const bidb = blockIdx.z;
 
-        bool const is_varlen = Varlen && params.cu_seqlens != nullptr;
-        int const offset_o = !is_varlen ? 0 : params.cu_seqlens[bidb];
-        int const seqlen_o = !is_varlen ? get<0>(params.shape_O) : (params.seqused ? params.seqused[bidb] : params.cu_seqlens[bidb + 1] - offset_o);
+        bool const is_flex = Varlen && params.seq_ranges != nullptr;
+        bool const is_varlen = (Varlen && params.cu_seqlens != nullptr) || is_flex;
+        int offset_o, seqlen_o;
+        if (is_flex){
+            offset_o = params.seq_ranges[2 * bidb];
+            seqlen_o = params.seq_ranges[2 * bidb + 1] - offset_o;
+        }
+        else{
+            offset_o = !is_varlen ? 0 : params.cu_seqlens[bidb];
+            seqlen_o = !is_varlen ? get<0>(params.shape_O) : (params.seqused ? params.seqused[bidb] : params.cu_seqlens[bidb + 1] - offset_o);
+        }
+
         if (is_varlen && m_block * kBlockM >= seqlen_o) { return; }
 
+        // 选一个头(total_tokens, headdim)
         Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O), params.shape_O, params.stride_O)(_, _, bidh, !is_varlen ? bidb : 0);
         Tensor gO = local_tile(cute::domain_offset(make_coord(offset_o, _0{}), mO), TileShape_MK{}, make_coord(m_block, _0{}));  // (M, K)
         Tensor mdO = make_tensor(make_gmem_ptr(params.ptr_dO), params.shape_O, params.stride_dO)(_, _, bidh, !is_varlen ? bidb : 0);
@@ -208,7 +221,13 @@ public:
         // If varlen, the layout for dPSum, LSE_log2, and dQaccum is that we pad each sequence in the batch
         // by an extra 128, so that the write for each sequence doesn't touch the next sequence.
         // Sequence i starts at params.cu_seqlens[i] + i * 128 and ends at params.cu_seqlens[i + 1] + i * 128
-        int const offset_padded = !is_varlen ? 0 : (params.cu_seqlens[bidb] + bidb * 128) / 128 * 128;
+        int offset_padded;
+        if (is_flex){
+            offset_padded = (params.seq_ranges[2 * bidb] + bidb * 128) / 128 * 128;
+        }
+        else{
+            offset_padded = !is_varlen ? 0 : (params.cu_seqlens[bidb] + bidb * 128) / 128 * 128;
+        }
         Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_dPsum, params.stride_dPsum)(_, bidh, !is_varlen ? bidb : 0);
         Tensor gdPsum = local_tile(cute::domain_offset(make_coord(offset_padded), mdPsum), Shape<Int<kBlockM>>{}, make_coord(m_block));
         if (thread_idx % kGmemThreadsPerRow == 0) {

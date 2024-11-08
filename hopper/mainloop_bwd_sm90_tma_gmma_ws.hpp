@@ -284,6 +284,8 @@ struct CollectiveMainloopBwd {
         int const* seqused_v = nullptr;
         int window_size_left;
         int window_size_right;
+        int const* q_ranges = nullptr;
+        int const* k_ranges = nullptr;
     };
 
     // Device side kernel params
@@ -312,6 +314,8 @@ struct CollectiveMainloopBwd {
         int const* seqused_k = nullptr;
         int window_size_left;
         int window_size_right;
+        int const* q_ranges = nullptr;
+        int const* k_ranges = nullptr;  
     };
 
     static Params
@@ -372,7 +376,7 @@ struct CollectiveMainloopBwd {
                 args.ptr_LSE_log2, args.shape_LSE, args.stride_LSE_log2, args.ptr_dPsum, args.stride_dPsum,
                 args.softmax_scale, float(args.softmax_scale * M_LOG2E),
                 args.num_batch, args.dq_semaphore, args.cu_seqlens_q, args.cu_seqlens_k,
-                args.seqused_k, args.seqused_v, args.window_size_left, args.window_size_right};
+                args.seqused_k, args.seqused_v, args.window_size_left, args.window_size_right, args.q_ranges, args.k_ranges};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -392,12 +396,17 @@ struct CollectiveMainloopBwd {
         if constexpr (!Varlen) {
             return get<0>(params.shape_Q);
         } else {
-            return params.cu_seqlens_q == nullptr
+            if (params.q_ranges != nullptr){
+                return params.q_ranges[2 * bidb + 1] - params.q_ranges[2 * bidb];
+            }
+            else{
+                return params.cu_seqlens_q == nullptr
                 ? get<0>(params.shape_Q)
                 : (params.seqused_q
                     ? params.seqused_q[bidb]
                     : params.cu_seqlens_q[bidb + 1] - params.cu_seqlens_q[bidb]
                 );
+            }
         }
     }
 
@@ -406,12 +415,17 @@ struct CollectiveMainloopBwd {
         if constexpr (!Varlen) {
             return get<0>(params.shape_K);
         } else {
-            return params.cu_seqlens_k == nullptr
+            if (params.k_ranges != nullptr){
+                return params.k_ranges[2 * bidb + 1] - params.k_ranges[2 * bidb];
+            }
+            else{
+                return params.cu_seqlens_k == nullptr
                 ? get<0>(params.shape_K)
                 : (params.seqused_k
                     ? params.seqused_k[bidb]
                     : params.cu_seqlens_k[bidb + 1] - params.cu_seqlens_k[bidb]
                 );
+            }
         }
     }
 
@@ -468,8 +482,10 @@ struct CollectiveMainloopBwd {
         uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
         constexpr uint32_t cluster_shape_x = get<0>(ClusterShape());
         uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
-        bool const is_varlen_q = Varlen && params.cu_seqlens_q != nullptr;
-        bool const is_varlen_k = Varlen && params.cu_seqlens_k != nullptr;
+        bool const is_flex_q = params.q_ranges != nullptr;
+        bool const is_flex_k = params.k_ranges != nullptr;
+        bool const is_varlen_q = (Varlen && params.cu_seqlens_q != nullptr) || is_flex_q;
+        bool const is_varlen_k = (Varlen && params.cu_seqlens_k != nullptr) || is_flex_k;
         Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor mdO = params.tma_load_dO.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor mK = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
@@ -477,9 +493,23 @@ struct CollectiveMainloopBwd {
         Tensor mLSE = params.tma_load_LSE.get_tma_tensor(params.shape_LSE)(_, bidh, !is_varlen_q ? bidb : 0);
         Tensor mdPsum = params.tma_load_dPsum.get_tma_tensor(params.shape_LSE)(_, bidh, !is_varlen_q ? bidb : 0);
 
-        int const offset_q = !is_varlen_q ? 0 : params.cu_seqlens_q[bidb];
-        int const offset_k = !is_varlen_k ? 0 : params.cu_seqlens_k[bidb];
-        int const offset_padded = !is_varlen_q ? 0 : (params.cu_seqlens_q[bidb] + bidb * 128) / 128 * 128;
+        int offset_q, offset_padded, offset_k;
+        if (is_flex_q){ 
+            assert(params.cu_seqlens_q == nullptr);
+            offset_q = params.q_ranges[2 * bidb];
+            offset_padded = (params.q_ranges[2 * bidb] + bidb * 128) / 128 * 128;
+        }
+        else{
+            offset_q = !is_varlen_q ? 0 : params.cu_seqlens_q[bidb];
+            offset_padded = !is_varlen_q ? 0 : (params.cu_seqlens_q[bidb] + bidb * 128) / 128 * 128;
+        }
+        if (is_flex_k){
+            assert(params.cu_seqlens_k == nullptr);
+            offset_k = params.k_ranges[2 * bidb];
+        }
+        else{
+            offset_k = !is_varlen_k ? 0 : params.cu_seqlens_k[bidb];
+        }
         Tensor gQ = local_tile(domain_offset(make_coord(offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (M, K, _)
         Tensor gdO = local_tile(domain_offset(make_coord(offset_q, _0{}), mdO), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (M, K, _)
         Tensor gK = local_tile(domain_offset(make_coord(offset_k, _0{}), mK), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (N, K)
@@ -579,9 +609,17 @@ struct CollectiveMainloopBwd {
         Tensor sdQnoswizzle = make_tensor(make_smem_ptr(shared_storage.mainloop.smem_dqacc.data()), SmemLayoutdQaccumTMANoSwizzle{});
         auto [n_block, bidh, bidb] = block_coord;
 
-        bool const is_varlen_q = Varlen && params.cu_seqlens_q != nullptr;
+        bool const is_flex_q = Varlen && params.q_ranges != nullptr;
+        bool const is_varlen_q = (Varlen && params.cu_seqlens_q != nullptr) || is_flex_q;
         // We reshaped dQaccum to have last dimension 32, so the offset needs to be multiplied by kHeadDim / 32
-        int const offset_padded = !is_varlen_q ? 0 : ((params.cu_seqlens_q[bidb] + bidb * 128) / 128 * 128) * (kHeadDim / ElemsPerRowTMA);
+        int offset_padded;
+        if (is_flex_q){
+            assert(params.cu_seqlens_q == nullptr);
+            offset_padded = ((params.q_ranges[2 * bidb] + bidb * 128) / 128 * 128) * (kHeadDim / ElemsPerRowTMA);
+        }
+        else{
+            offset_padded = !is_varlen_q ? 0 : ((params.cu_seqlens_q[bidb] + bidb * 128) / 128 * 128) * (kHeadDim / ElemsPerRowTMA);
+        }
         // Prepare the TMA loads
         Tensor mdQaccum = params.tma_add_dQ.get_tma_tensor(params.shape_dQaccum)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor gdQaccum = local_tile(domain_offset(make_coord(offset_padded, _0{}), mdQaccum), TileShape_dQaccum{}, make_coord(_, _0{}));  // (M, K, _)

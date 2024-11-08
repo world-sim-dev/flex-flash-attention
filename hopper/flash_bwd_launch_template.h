@@ -47,7 +47,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.b,
         params.dq_semaphore,
         params.cu_seqlens_q,
-        params.seqused_q
+        params.seqused_q,
+        params.q_ranges
     };
     typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
     int num_m_block = cute::ceil_div(params.seqlen_q, kBlockM);
@@ -60,7 +61,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     using CollectiveMainloop = flash::CollectiveMainloopBwd<Stages, ClusterShape, TileShape_MNK, Element, ElementAccum, cutlass::arch::Sm90,
             Is_causal, Is_local, Varlen, Deterministic,
             dKV_swapAB, dQ_swapAB, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>;
-    using CollectiveEpilogue = flash::CollectiveEpilogueBwd<TileShape_MNK, Element, CollectiveMainloop::NumMmaThreads, Varlen>;
+    using CollectiveEpilogue = flash::CollectiveEpilogueBwd<TileShape_MNK, Element, ElementAccum, CollectiveMainloop::NumMmaThreads, Varlen>;
     using Scheduler = flash::SingleTileSchedulerBwd;
     using AttnKernel = flash::FlashAttnBwd<CollectiveMainloop, CollectiveEpilogue, Scheduler>;
 
@@ -90,15 +91,18 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.dq_semaphore,
         params.cu_seqlens_q, params.cu_seqlens_k,
         params.seqused_q, params.seqused_k,
-        params.window_size_left, params.window_size_right
+        params.window_size_left, params.window_size_right,
+        params.q_ranges, params.k_ranges
     };
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<Element*>(params.dk_ptr),
         {!Varlen ? params.seqlen_k : params.total_k, params.d, params.h, !Varlen ? params.b : 1},  // shape_dK
         {params.dk_row_stride, _1{}, params.dk_head_stride, !Varlen ? params.dk_batch_stride : 0},  // stride_dK
         static_cast<Element*>(params.dv_ptr),
-        {params.dv_row_stride, _1{}, params.dv_head_stride, !Varlen ? params.dv_batch_stride : 0},
-        params.cu_seqlens_k
+        {params.dv_row_stride, _1{}, params.dv_head_stride, !Varlen ? params.dv_batch_stride : 0}, // stride_dV
+        params.cu_seqlens_k,
+        params.seqused_k,
+        params.k_ranges
     };
 
     int num_blocks_n = cutlass::ceil_div(params.seqlen_k, get<1>(TileShape_MNK{}));
@@ -151,7 +155,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         {params.dq_row_stride, _1{}, params.dq_head_stride, params.dq_batch_stride},  // stride_dQ
         params.scale_softmax,
         params.cu_seqlens_q,
-        params.seqused_q
+        params.seqused_q,
+        params.q_ranges
     };
     typename PostprocessKernel::Params postprocess_params = PostprocessKernel::to_underlying_arguments(postprocess_args);
     int num_m_block_postprocess = cute::ceil_div(params.seqlen_q, get<0>(TileShape_MK{}));
@@ -173,7 +178,7 @@ void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 64;
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
         BOOL_SWITCH(params.is_local, Is_local, [&] {
-            BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
+            BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr || params.q_ranges != nullptr || params.k_ranges != nullptr, Varlen, [&] {
                 BOOL_SWITCH(params.deterministic, Deterministic, [&] {
                     run_flash_bwd<Headdim, 128, 128, T, Is_causal, Is_local && !Is_causal, Varlen, Deterministic, false, false, 1, 2, 2>(params, stream);
                 });
@@ -187,7 +192,7 @@ void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 96;
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
         BOOL_SWITCH(params.is_local, Is_local, [&] {
-            BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
+            BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr || params.q_ranges != nullptr || params.k_ranges != nullptr, Varlen, [&] {
                 BOOL_SWITCH(params.deterministic, Deterministic, [&] {
                     run_flash_bwd<Headdim, 64, 128, T, Is_causal, Is_local && !Is_causal, Varlen, Deterministic, false, false, 1, 2, 1>(params, stream);
                 });
@@ -201,7 +206,7 @@ void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
         BOOL_SWITCH(params.is_local, Is_local, [&] {
-            BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
+            BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr || params.q_ranges != nullptr || params.k_ranges != nullptr, Varlen, [&] {
                 BOOL_SWITCH(params.deterministic, Deterministic, [&] {
                     run_flash_bwd<Headdim, 64, 128, T, Is_causal, Is_local && !Is_causal, Varlen, Deterministic, false, false, 1, 2, 1>(params, stream);
                 });
