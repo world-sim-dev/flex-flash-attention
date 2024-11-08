@@ -207,10 +207,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q, mainloop_params.qhead_per_khead_divmod);
 
             ++work_idx;
-            // printf("next work?\n");
         }
         collective_epilogue.store_tail();
-        // printf("finish?\n");
     }
 
 }

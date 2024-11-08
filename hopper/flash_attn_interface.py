@@ -594,6 +594,32 @@ def flex_flash_attn_func(
     softmax_scale=None,
     deterministic=False,
 ):
+    """
+    Flexible Flash Attention.
+    Implements flexible mask control, supporting different key-value pairs for each query.
+
+    Args:
+        q: (batch_size * seqlen_q, nheads, headdim)
+        k: (batch_size * seqlen_k, nheads_k, headdim)
+        v: (batch_size * seqlen_k, nheads_k, headdim)
+        q_ranges: (batch_size, 2), dtype torch.int32. The start and end indices of the queries in the batch.
+            NOTE: Different ranges cannot overlap
+        k_ranges: (batch_size, 2), dtype torch.int32. The start and end indices of the keys in the batch.
+            NOTE: Different ranges can overlap
+        max_seqlen_q: int. The maximum sequence length of the queries.
+        max_seqlen_k: int. The maximum sequence length of the keys.
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
+            NOTE: Not implemented yet.
+    
+    Returns:
+        out: (batch_size * seqlen_q, nheads, headdim)
+        softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen_q). The
+            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
+            normalization factor).
+    """
     return FlexFlashAttnFunc.apply(
         q,
         k,
