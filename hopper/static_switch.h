@@ -55,11 +55,16 @@
     }                                                                          \
   }()
 
-#define SEQLEN_SWITCH(USE_VAR_SEQ_LEN, NAME, ...)                              \
+#define SEQLEN_SWITCH(USE_VAR_SEQ_LEN, USE_FLEX_FLASH, NAME, ...)              \
   [&] {                                                                        \
     bool useSeqLen = USE_VAR_SEQ_LEN;                                          \
+    bool useFlexFlash = USE_FLEX_FLASH;                                        \
+    assert(!(useSeqLen && useFlexFlash));                                      \
     if (useSeqLen) {                                                           \
       using NAME = flash::VarSeqLenTraits;                                     \
+      return __VA_ARGS__();                                                    \
+    } else if (useFlexFlash) {                                                 \
+      using NAME = flash::FlexFlashTraits;                                     \
       return __VA_ARGS__();                                                    \
     } else {                                                                   \
       using NAME = flash::FixedSeqLenTraits;                                   \

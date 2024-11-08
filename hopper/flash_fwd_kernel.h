@@ -118,6 +118,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
                 seqlen_traits_q.init(bidb);
                 seqlen_traits_k.init(bidb);
+
                 if constexpr(seqlen_traits_q.UseVarSeqLen) {
                     // NOTE: to support in future with gqa packed layouts, changed kBlockM to kBlockM/kBlockH
                     if (m_block * (kBlockM/kBlockH) >= seqlen_traits_q.actual_seq_len) {
@@ -171,6 +172,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
             seqlen_traits_q.init(bidb);
             seqlen_traits_k.init(bidb);
+            // printf("m_block = %d, n_split_idx = %d, bidh = %d, bidb = %d\n", m_block, n_split_idx, bidh, bidb);
+            // printf("hello, world from blockIdx = %d, actual_seq_len = %d\n", blockIdx.x, seqlen_traits_k.actual_seq_len);
             if constexpr(seqlen_traits_q.UseVarSeqLen) {
                 // NOTE: to support in future with gqa packed layouts, changed kBlockM to kBlockM/kBlockH
                 if (m_block * (kBlockM/kBlockH) >= seqlen_traits_q.actual_seq_len) {
@@ -204,8 +207,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q, mainloop_params.qhead_per_khead_divmod);
 
             ++work_idx;
+            // printf("next work?\n");
         }
         collective_epilogue.store_tail();
+        // printf("finish?\n");
     }
 
 }

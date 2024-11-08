@@ -103,6 +103,7 @@ public:
         float const softmax_scale;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        int const* seq_ranges = nullptr;
     };
 
     // Kernel entry point API
@@ -115,6 +116,7 @@ public:
         float const softmax_scale;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        int const* seq_ranges = nullptr;
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -136,7 +138,8 @@ public:
             args.stride_dQ,
             args.softmax_scale,
             args.cu_seqlens,
-            args.seqused
+            args.seqused,
+            args.seq_ranges
         };
     }
 
@@ -158,8 +161,16 @@ public:
         int const bidh = blockIdx.y;
         int const bidb = blockIdx.z;
 
-        bool const is_varlen = params.cu_seqlens != nullptr;
-        int const seqlen = !is_varlen ? get<0>(params.shape_dQ) : (params.seqused ? params.seqused[bidb] : params.cu_seqlens[bidb + 1] - params.cu_seqlens[bidb]);
+        bool const is_flex = params.seq_ranges != nullptr;
+        bool const is_varlen = (params.cu_seqlens != nullptr) || is_flex;
+        int seqlen;
+        if (is_flex){
+            assert(params.cu_seqlens == nullptr);
+            seqlen = params.seq_ranges[2 * bidb + 1] - params.seq_ranges[2 * bidb];
+        }
+        else{
+            seqlen = !is_varlen ? get<0>(params.shape_dQ) : (params.seqused ? params.seqused[bidb] : params.cu_seqlens[bidb + 1] - params.cu_seqlens[bidb]);
+        }
         if (is_varlen && m_block * kBlockM >= seqlen) { return; }
 
         int lane_predicate = cute::elect_one_sync();
@@ -173,7 +184,14 @@ public:
 
         // Step 1: TMA to load dQaccum from gmem to smem
         // We reshaped dQaccum to have last dimension 32, so the offset needs to be multiplied by kHeadDim / 32
-        int const offset_padded = !is_varlen ? 0 : ((params.cu_seqlens[bidb] + bidb * 128) / 128 * 128) * (kHeadDim / get<1>(SmemLayoutdQaccumTMA{}.shape()));
+        int offset_padded;
+        if (is_flex){
+            assert(params.cu_seqlens == nullptr);
+            offset_padded = ((params.seq_ranges[2 * bidb] + bidb * 128) / 128 * 128) * (kHeadDim / get<1>(SmemLayoutdQaccumTMA{}.shape()));
+        }
+        else{
+            offset_padded = !is_varlen ? 0 : ((params.cu_seqlens[bidb] + bidb * 128) / 128 * 128) * (kHeadDim / get<1>(SmemLayoutdQaccumTMA{}.shape()));
+        }
         Tensor mdQaccum = params.tma_load_dQaccum.get_tma_tensor(params.shape_dQaccum)(_, _, bidh, !is_varlen ? bidb : 0);
         Tensor gdQaccum = local_tile(domain_offset(make_coord(offset_padded, _0{}), mdQaccum), SmemLayoutdQaccumTMA{}.shape(), make_coord(m_block, _0{}));  // (M, K)
         auto block_tma_dQ = params.tma_load_dQaccum.get_slice(_0{});
@@ -224,7 +242,14 @@ public:
         __syncthreads();
 
         // Step 4: Copy dQ from smem to register to prepare for coalesced write to gmem
-        int const offset = !is_varlen ? 0 : params.cu_seqlens[bidb];
+        int offset;
+        if (is_flex){
+            assert(params.cu_seqlens == nullptr);
+            offset = params.seq_ranges[2 * bidb];
+        }
+        else{
+            offset = !is_varlen ? 0 : params.cu_seqlens[bidb];
+        }
         Tensor mdQ = make_tensor(make_gmem_ptr(params.ptr_dQ), params.shape_dQ, params.stride_dQ)(_, _, bidh, !is_varlen ? bidb : 0);
         Tensor gdQ = local_tile(domain_offset(make_coord(offset, _0{}), mdQ), TileShape_MK{}, make_coord(m_block, _0{}));  // (M, K)
         GmemTiledCopy gmem_tiled_copy_dQ;

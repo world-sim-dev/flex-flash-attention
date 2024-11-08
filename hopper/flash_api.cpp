@@ -46,7 +46,10 @@ void set_params_fprop(Flash_fwd_params &params,
                       int window_size_left,
                       int window_size_right,
                       bool seqlenq_ngroups_swapped=false,
-                      bool unpadded_lse=false) {
+                      bool unpadded_lse=false,
+                      // device pointers only used for flex flash attention
+                      void *q_ranges_d=nullptr,
+                      void *k_ranges_d=nullptr) {
 
     // Reset the parameters
     params = {};
@@ -83,6 +86,8 @@ void set_params_fprop(Flash_fwd_params &params,
 
     params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
     params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
+    params.q_ranges = static_cast<int *>(q_ranges_d);
+    params.k_ranges = static_cast<int *>(k_ranges_d);
     params.seqused_q = static_cast<int *>(seqused_q);
     params.seqused_k = static_cast<int *>(seqused_k);
 
@@ -191,7 +196,9 @@ void set_params_dgrad(Flash_bwd_params &params,
                       float softmax_scale,
                       int window_size_left,
                       int window_size_right,
-                      bool deterministic) {
+                      bool deterministic,
+                      void *q_ranges_d,
+                      void *k_ranges_d) {
 
     set_params_fprop(params,
                      b, b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
@@ -205,7 +212,10 @@ void set_params_dgrad(Flash_bwd_params &params,
                      p_dropout,
                      softmax_scale,
                      window_size_left,
-                     window_size_right);
+                     window_size_right,
+                     false, false,
+                     q_ranges_d,
+                     k_ranges_d);
 
     // Set the pointers and strides.
     params.do_ptr = dout.data_ptr();
@@ -937,6 +947,10 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         dv_expanded = dv;
     }
 
+    // Because we're using TMA reduce add, we need to zero out dk_expanded and dv_expanded
+    dk_expanded.zero_();
+    dv_expanded.zero_();
+
     if (is_causal) { window_size_right = 0; }
 
     Flash_bwd_params params;
@@ -964,7 +978,9 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
                      softmax_scale,
                      /*window_size_left=*/window_size_left,
                      /*window_size_right=*/window_size_right,
-                     deterministic);
+                     deterministic,
+                     /*q_ranges_d=*/nullptr,
+                     /*k_ranges_d=*/nullptr);
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
 
     // Will be zero'ed out in the backward preprocess kernel
@@ -976,8 +992,6 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         run_mha_bwd(params, stream);
     } else {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
-        dk_expanded.zero_();
-        dv_expanded.zero_();
         softmax_d.zero_();
     }
 
@@ -1157,6 +1171,10 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
         dv_expanded = dv;
     }
 
+    // Because we're using TMA reduce add, we need to zero out dk_expanded and dv_expanded
+    dk_expanded.zero_();
+    dv_expanded.zero_();
+
     Flash_bwd_params params;
 
     set_params_dgrad(params,
@@ -1182,7 +1200,9 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
                      softmax_scale,
                      /*window_size_left=*/window_size_left,
                      /*window_size_right=*/window_size_right,
-                     deterministic);
+                     deterministic,
+                     /*q_ranges_d=*/nullptr,
+                     /*k_ranges_d=*/nullptr);
     params.total_q = total_q;
     params.total_k = total_k;
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
@@ -1195,8 +1215,6 @@ mha_varlen_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
         run_mha_bwd(params, stream);
     } else {
         // If max_seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
-        dk_expanded.zero_();
-        dv_expanded.zero_();
         softmax_d.zero_();
     }
 
@@ -1549,6 +1567,342 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     return {out, softmax_lse};
 }
 
+std::vector<at::Tensor>
+flex_flash_fwd(
+    at::Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+    const at::Tensor &k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
+    const at::Tensor &v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
+    c10::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+    const at::Tensor &q_ranges, // b x 2, q_ranges[i] = [start_i, end_i]
+    const at::Tensor &k_ranges, // b x 2, k_ranges[i] = [start_i, end_i]
+    const int max_seqlen_q,
+    const int max_seqlen_k,
+    const float softmax_scale,
+    const bool deterministic)
+{
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
+    TORCH_CHECK(is_sm90, "FlexFlashAttention only supports Hopper GPUs or newer.");
+
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+                "FlashAttention only support fp16 and bf16 data type");
+    TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+    TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    TORCH_CHECK(q_ranges.dtype() == torch::kInt32, "q_ranges must have dtype int32");
+    TORCH_CHECK(k_ranges.dtype() == torch::kInt32, "k_ranges must have dtype int32");
+
+    CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
+    CHECK_DEVICE(q_ranges); CHECK_DEVICE(k_ranges);
+
+    TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    CHECK_CONTIGUOUS(q_ranges); CHECK_CONTIGUOUS(k_ranges);
+
+    const auto sizes = q.sizes();
+
+    const int batch_size = q_ranges.size(0);
+    int num_heads = sizes[1];
+    const int head_size_og = sizes[2];
+    const int num_heads_k = k.size(1);
+
+    void *q_ranges_d = q_ranges.data_ptr();
+    void *k_ranges_d = k_ranges.data_ptr();
+
+    const int total_q = q.sizes()[0];
+
+    TORCH_CHECK(batch_size > 0, "batch size must be positive");
+    TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
+    TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+    CHECK_SHAPE(q, total_q, num_heads, head_size_og);
+    const int total_k = k.size(0);
+    CHECK_SHAPE(k, total_k, num_heads_k, head_size_og);
+    CHECK_SHAPE(v, total_k, num_heads_k, head_size_og);
+
+    CHECK_SHAPE(q_ranges, batch_size, 2);
+    CHECK_SHAPE(k_ranges, batch_size, 2);
+
+    at::Tensor q_padded, k_padded, v_padded;
+    if (head_size_og % 8 != 0) {
+        q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+        k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+        v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+    } else {
+        q_padded = q;
+        k_padded = k;
+        v_padded = v;
+    }
+
+    at::Tensor out;
+    if (out_.has_value()) {
+        out = out_.value();
+        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        CHECK_DEVICE(out);
+        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+        CHECK_SHAPE(out, sizes[0], sizes[1], head_size_og);
+        if (head_size_og % 8 != 0) { out = torch::empty_like(q_padded); }
+    } else {
+        out = torch::empty_like(q_padded);
+    }
+
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    const int head_size = round_multiple(head_size_og, 8);
+    const int head_size_rounded = round_multiple(head_size, 32);
+    const int seqlen_q_rounded = round_multiple(max_seqlen_q, 128);
+    const int seqlen_k_rounded = round_multiple(max_seqlen_k, 128);
+
+    // Otherwise the kernel will be launched from cuda:0 device
+    // Cast to char to avoid compiler warning about narrowing
+    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+
+    auto opts = q.options();
+    auto softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
+
+    Flash_fwd_params params;
+    set_params_fprop(params,
+                     batch_size, batch_size,
+                     max_seqlen_q, max_seqlen_k,
+                     seqlen_q_rounded, seqlen_k_rounded,
+                     num_heads, num_heads_k,
+                     head_size, head_size_rounded,
+                     q_padded, k_padded, v_padded, out,
+                     /*cu_seqlens_q_d*/nullptr,
+                     /*cu_seqlens_k_d*/nullptr,
+                     /*seqused_q_d*/nullptr,
+                     /*seqused_k_d*/nullptr,
+                     /*p_d=*/nullptr,
+                     softmax_lse.data_ptr(),
+                     /*p_dropout=*/0.f,
+                     softmax_scale,
+                     /*window_size_left=*/-1,
+                     /*window_size_right=*/-1,
+                     /*seqlenq_ngroups_swapped=*/false,
+                     /*unpadded_lse=*/true,
+                     /*q_ranges_d=*/q_ranges_d,
+                     /*k_ranges_d=*/k_ranges_d);
+    params.total_q = total_q;
+    params.total_k = total_k;
+
+    if (max_seqlen_k > 0) {
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        run_mha_fwd(params, stream);
+    } else {
+        // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
+        out.zero_();
+        softmax_lse.fill_(std::numeric_limits<float>::infinity());
+    }
+
+    at::Tensor out_padded = out;
+    if (head_size_og % 8 != 0) {
+        out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+        if (out_.has_value()) { out_.value().copy_(out); }
+    }
+
+    return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse};
+}
+
+
+std::vector<at::Tensor>
+flex_flash_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_size_og
+               const at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_size
+               const at::Tensor &k,   // batch_size x seqlen_k x num_heads_k x head_size
+               const at::Tensor &v,   // batch_size x seqlen_k x num_heads_k x head_size
+               const at::Tensor &out,   // batch_size x seqlen_q x num_heads x head_size
+               const at::Tensor &softmax_lse,     // b x h x seqlen_q
+               c10::optional<at::Tensor> &dq_,   // batch_size x seqlen_q x num_heads x head_size
+               c10::optional<at::Tensor> &dk_,   // batch_size x seqlen_k x num_heads_k x head_size
+               c10::optional<at::Tensor> &dv_,   // batch_size x seqlen_k x num_heads_k x head_size
+               const at::Tensor &q_ranges, // b x 2, q_ranges[i] = [start_i, end_i]
+               const at::Tensor &k_ranges, // b x 2, k_ranges[i] = [start_i, end_i]
+               const int max_seqlen_q,
+               const int max_seqlen_k,          // max sequence length to choose the kernel
+               const float softmax_scale,
+               const bool deterministic) {
+
+    #ifdef FLASHATTENTION_DISABLE_BACKWARD
+        TORCH_CHECK(false, "This flash attention build does not support backward.");
+    #endif
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    bool is_sm9x = dprops->major == 9 && dprops->minor >= 0;
+    TORCH_CHECK(is_sm9x, "FlashAttentionHopper only supports Hopper GPUs or newer.");
+
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+                "FlashAttention only support fp16 and bf16 data type");
+    TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+    TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    TORCH_CHECK(out.dtype() == q_dtype, "query and out must have the same dtype");
+    TORCH_CHECK(dout.dtype() == q_dtype, "query and dout must have the same dtype");
+    TORCH_CHECK(q_ranges.dtype() == torch::kInt32, "q_ranges must have dtype int32");
+    TORCH_CHECK(k_ranges.dtype() == torch::kInt32, "k_ranges must have dtype int32");
+
+    CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
+    CHECK_DEVICE(out); CHECK_DEVICE(dout); CHECK_DEVICE(softmax_lse);
+    CHECK_DEVICE(q_ranges); CHECK_DEVICE(k_ranges);
+
+    TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(out.stride(-1) == 1, "out tensor must have contiguous last dimension");
+    TORCH_CHECK(dout.stride(-1) == 1, "dout tensor must have contiguous last dimension");
+    CHECK_CONTIGUOUS(q_ranges); CHECK_CONTIGUOUS(k_ranges);
+
+    const auto sizes = q.sizes();
+
+    const int total_q = sizes[0];
+    const int batch_size = q_ranges.size(0);
+    const int num_heads = sizes[1];
+    const int head_size_og = dout.size(2);
+    const int head_size = sizes[2];
+    const int total_k = k.size(0);
+    const int num_heads_k = k.size(1);
+    TORCH_CHECK(batch_size > 0, "batch size must be positive");
+    TORCH_CHECK(head_size % 8 == 0, "head_size should be a multiple of 8");
+    TORCH_CHECK(head_size <= 128, "FlashAttention backward only supports head dimension at most 128");
+    TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    const int head_size_rounded = head_size <= 64 ? 64 : round_multiple(head_size, 32);
+    // This should match the kernel configs
+    const int kBlockM = head_size <= 64 ? 128 : (head_size < 256 ? 64 : 32);
+    const int seqlen_q_rounded = round_multiple(max_seqlen_q, kBlockM);
+    const int seqlen_k_rounded = round_multiple(max_seqlen_k, 128);
+    int const total_q_padded_rounded = round_multiple(total_q + batch_size * 128, 128);
+
+    TORCH_CHECK(head_size == round_multiple(head_size_og, 8), "head_size must be head_size_og rounded to a multiple of 8");
+
+    CHECK_SHAPE(q, total_q, num_heads, head_size_og);
+    CHECK_SHAPE(k, total_k, num_heads_k, head_size_og);
+    CHECK_SHAPE(v, total_k, num_heads_k, head_size_og);
+    CHECK_SHAPE(out, total_q, num_heads, head_size);
+    CHECK_SHAPE(dout, total_q, num_heads, head_size_og);
+    CHECK_SHAPE(q_ranges, batch_size, 2);
+    CHECK_SHAPE(k_ranges, batch_size, 2);
+
+    void *q_ranges_d = q_ranges.data_ptr();
+    void *k_ranges_d = k_ranges.data_ptr();
+
+    at::Tensor dq, dk, dv;
+    if (dq_.has_value()) {
+        dq = dq_.value();
+        TORCH_CHECK(dq.dtype() == q_dtype, "dq must have the same dtype as q");
+        CHECK_DEVICE(dq);
+        TORCH_CHECK(dq.stride(-1) == 1, "dq must have contiguous last dimension");
+        CHECK_SHAPE(dq, total_q, num_heads, head_size);
+    } else {
+        dq = torch::empty_like(q);
+    }
+    if (dk_.has_value()) {
+        dk = dk_.value();
+        TORCH_CHECK(dk.dtype() == q_dtype, "dk must have the same dtype as q");
+        CHECK_DEVICE(dk);
+        TORCH_CHECK(dk.stride(-1) == 1, "dk must have contiguous last dimension");
+        CHECK_SHAPE(dk, total_k, num_heads_k, head_size);
+    } else {
+        dk = torch::empty_like(k);
+    }
+    if (dv_.has_value()) {
+        dv = dv_.value();
+        TORCH_CHECK(dv.dtype() == q_dtype, "dv must have the same dtype as q");
+        CHECK_DEVICE(dv);
+        TORCH_CHECK(dv.stride(-1) == 1, "dv must have contiguous last dimension");
+        CHECK_SHAPE(dv, total_k, num_heads_k, head_size);
+    } else {
+        dv = torch::empty_like(v);
+    }
+
+    at::Tensor dout_padded;
+    if (head_size_og % 8 != 0) {
+        dout_padded = torch::nn::functional::pad(dout, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+    } else {
+        dout_padded = dout;
+    }
+
+    // Otherwise the kernel will be launched from cuda:0 device
+    // Cast to char to avoid compiler warning about narrowing
+    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+
+    auto opts = q.options();
+    // Need softmax_d to have total_q_padded_rounded since we want its address to be aligned by 16/8 bytes for TMA / LDG.64
+    auto softmax_d = torch::empty({num_heads, total_q_padded_rounded}, opts.dtype(at::kFloat));
+    auto softmax_lse_log2 = torch::empty({num_heads, total_q_padded_rounded}, opts.dtype(at::kFloat));
+    at::Tensor dq_accum;
+    at::Tensor dk_accum, dv_accum;
+    dq_accum = torch::empty({num_heads, total_q_padded_rounded, head_size_rounded}, opts.dtype(at::kFloat));
+
+    at::Tensor dk_expanded, dv_expanded;
+    if (num_heads_k != num_heads) {  // MQA / GQA
+        dk_expanded = torch::empty({total_k, num_heads, head_size}, opts);
+        dv_expanded = torch::empty({total_k, num_heads, head_size}, opts);
+    } else {
+        dk_expanded = dk;
+        dv_expanded = dv;
+    }
+
+    // Because we're using TMA reduce add, we need to zero out dk_expanded and dv_expanded
+    dk_expanded.zero_();
+    dv_expanded.zero_();
+
+    Flash_bwd_params params;
+
+    set_params_dgrad(params,
+                     batch_size,
+                     max_seqlen_q, max_seqlen_k,
+                     seqlen_q_rounded, seqlen_k_rounded,
+                     num_heads, num_heads_k,
+                     head_size, head_size_rounded,
+                     q, k, v, out,
+                     dout_padded, dq, dk_expanded, dv_expanded,
+                     /*cu_seqlens_q=*/nullptr,
+                     /*cu_seqlens_k=*/nullptr,
+                     /*seqused_q=*/nullptr,
+                     /*seqused_k=*/nullptr,
+                     /*dq_accum=*/dq_accum.data_ptr(),
+                     /*dk_accum=*/nullptr,
+                     /*dv_accum=*/nullptr,
+                     softmax_lse.data_ptr(),
+                     softmax_d.data_ptr(),
+                     /*p_dropout=*/0.f,
+                     softmax_scale,
+                     /*window_size_left=*/-1,
+                     /*window_size_right=*/-1,
+                     deterministic,
+                     q_ranges_d,
+                     k_ranges_d);
+
+    params.total_q = total_q;
+    params.total_k = total_k;
+    params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
+
+    // Will be zero'ed out in the backward preprocess kernel
+    at::Tensor dq_semaphore = torch::empty({(max_seqlen_q + kBlockM - 1) / kBlockM, batch_size, num_heads}, opts.dtype(torch::kInt32));
+    params.dq_semaphore = dq_semaphore.data_ptr<int>();
+
+    if (max_seqlen_q > 0) {
+        run_mha_bwd(params, stream);
+    } else {
+        // If max_seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
+        softmax_d.zero_();
+    }
+
+    // For MQA/GQA we need to sum dK and dV across the groups
+    if (num_heads_k != num_heads) {
+        at::sum_out(dk, at::reshape(dk_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}), {2});
+        at::sum_out(dv, at::reshape(dv_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}), {2});
+    }
+
+    if (head_size_og % 8 != 0) {
+        dq = dq.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+        dk = dk.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+        dv = dv.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+    }
+
+    return { dq, dk, dv, softmax_d, dq_accum, softmax_lse_log2 };
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
@@ -1557,4 +1911,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("varlen_fwd", &mha_varlen_fwd, "Forward pass (variable length)");
     m.def("varlen_bwd", &mha_varlen_bwd, "Varlen backward pass");
     m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
+    m.def("flex_flash_fwd", &flex_flash_fwd, "Flexible FlashAttention forward pass");
+    m.def("flex_flash_bwd", &flex_flash_bwd, "Flexible FlashAttention backward pass");
 }

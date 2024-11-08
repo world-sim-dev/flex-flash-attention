@@ -829,7 +829,9 @@ struct CollectiveMainloopFwd {
             ++smem_pipe_read_v;
             // softmax.rescale_o(tOrO, scores_scale);
             cute::copy(make_tensor(convert_type<Element>(tSrS).data(), convert_layout_acc_Aregs<typename Ktraits::TiledMma1>(tSrS.layout())), tOrP);
+            // printf("in loop\n");
         }
+        // printf("out loop\n");
         // Tell warp 0 that smem_q is ready
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
         softmax.rescale_o(tOrO, scores_scale);
