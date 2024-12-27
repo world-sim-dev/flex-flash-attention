@@ -79,7 +79,7 @@ struct SmemTransposeFp8_64x64 {
   }
 };
 
-template <typename Ktraits, bool Is_causal, bool Is_local, typename Seqlen_traits, typename Seqlen_traits_Q = Seqlen_traits>
+template <typename Ktraits, bool Is_local, typename Seqlen_traits, typename Seqlen_traits_Q = Seqlen_traits>
 struct CollectiveMainloopFwd {
 
     using Element = typename Ktraits::Element;
@@ -169,6 +169,7 @@ struct CollectiveMainloopFwd {
         int const qhead_per_khead;
         int const* cache_batch_idx;
         int const num_splits;
+        bool * is_causal_mapping;
     };
 
     // Device side kernel params
@@ -188,6 +189,7 @@ struct CollectiveMainloopFwd {
         int window_size_right;
         int const* cache_batch_idx;
         cutlass::FastDivmod num_splits_divmod;
+        bool * is_causal_mapping;
     };
 
 
@@ -221,7 +223,8 @@ struct CollectiveMainloopFwd {
                 args.descale_q_ptr, args.descale_k_ptr, args.descale_v_ptr,
                 args.window_size_left, args.window_size_right,
                 args.cache_batch_idx,
-                cutlass::FastDivmod(args.num_splits)};
+                cutlass::FastDivmod(args.num_splits),
+                args.is_causal_mapping};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -240,7 +243,8 @@ struct CollectiveMainloopFwd {
           const Seqlen_traits_Q& seqlen_traits_q,
           const Seqlen_traits& seqlen_traits_k,
           int& n_block_min,
-          int& n_block_max
+          int& n_block_max,
+          const bool is_causal
         ) {
         // static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -256,7 +260,7 @@ struct CollectiveMainloopFwd {
             n_block_max = std::min(n_block_max, (n_split_idx + 1) * n_blocks_per_split);
         }
 
-        if constexpr (Is_causal) {
+        if (is_causal) {    
             n_block_max = std::min(
                 n_block_max,
                 cute::ceil_div((m_block + 1) * kBlockM_div_H + seqlen_k - seqlen_q, kBlockN));
@@ -271,12 +275,13 @@ struct CollectiveMainloopFwd {
     }
 
     CUTLASS_DEVICE
-    void get_n_block_max(
+    void get_n_block_max( // NOTE(xiaowu): 哪里用到这个逼函数了
           Params const& mainloop_params,
           int m_block, 
           const Seqlen_traits_Q& seqlen_traits_q,
           const Seqlen_traits& seqlen_traits_k,
-          int& n_block_max
+          int& n_block_max,
+          const bool is_causal
         ) {
         // static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -284,7 +289,7 @@ struct CollectiveMainloopFwd {
         int const seqlen_q = seqlen_traits_q.actual_seq_len;
         int const seqlen_k = seqlen_traits_k.actual_seq_len;
         n_block_max = cute::ceil_div(seqlen_k, kBlockN);
-        if constexpr (Is_causal) {
+        if (is_causal) {
             n_block_max = std::min(n_block_max,
                 cute::ceil_div((m_block + 1) * kBlockM_div_H + seqlen_k - seqlen_q, kBlockN));
         }
@@ -659,7 +664,8 @@ struct CollectiveMainloopFwd {
         int m_block,
         SharedStorage& shared_storage,
         const Seqlen_traits_Q& seqlen_traits_q,
-        const Seqlen_traits& seqlen_traits_k
+        const Seqlen_traits& seqlen_traits_k,
+        const bool is_causal
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
 
@@ -736,7 +742,7 @@ struct CollectiveMainloopFwd {
             Tensor tScS = threadMma0.partition_C(cS);
             #pragma unroll
             for (int i = 0; i < size(tSrS); ++i) {
-                if constexpr (!Is_causal && !Is_local) {  // Just masking based on col
+                if (!is_causal && !Is_local) {  // Just masking based on col
                     if (int(get<1>(tScS(i))) >= int(seqlen_k - n_block * kBlockN)) { tSrS(i) = -INFINITY; }
                 } else {  // mask based on both row and col
                     // using std::min is faster than doing col >= limit0 or col >= limit1
@@ -760,7 +766,7 @@ struct CollectiveMainloopFwd {
         Tensor scores_scale = make_fragment_like(softmax.row_max);
         clear(scores_scale);
 
-        constexpr int n_masking_steps = !Is_causal ? 1 : cute::ceil_div(kBlockM_div_H, kBlockN) + 1;
+        int n_masking_steps = !is_causal ? 1 : cute::ceil_div(kBlockM_div_H, kBlockN) + 1;
         // Only go through these if Is_causal, since n_masking_steps = 1 when !Is_causal
         #pragma unroll
         for (int masking_step = 0; masking_step < n_masking_steps - 1 && n_block > n_block_min; ++masking_step, --n_block) {
@@ -859,7 +865,8 @@ struct CollectiveMainloopFwd {
         int m_block,
         SharedStorage& shared_storage,
         const Seqlen_traits_Q& seqlen_traits_q,
-        const Seqlen_traits& seqlen_traits_k
+        const Seqlen_traits& seqlen_traits_k,
+        const bool is_causal
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
 
@@ -935,7 +942,7 @@ struct CollectiveMainloopFwd {
             Tensor tScS = threadMma0.partition_C(cS);
             #pragma unroll
             for (int i = 0; i < size(tSrS); ++i) {
-                if constexpr (!Is_causal && !Is_local) {  // Just masking based on col                
+                if (!is_causal && !Is_local) {  // Just masking based on col                
                     if (int(get<1>(tScS(i))) >= int(seqlen_k - n_block * kBlockN)) { tSrS(i) = -INFINITY; }
                 } else {  // mask based on both row and col
                     int row = int(get<0>(tScS(i))) / kBlockH;
@@ -963,9 +970,9 @@ struct CollectiveMainloopFwd {
 
         ++smem_pipe_read;
         --n_block;
-        constexpr int extra_iterations = !Is_causal ? kStages - 1 : cute::ceil_div(kBlockM_div_H, kBlockN);        
+        int extra_iterations = !is_causal ? kStages - 1 : cute::ceil_div(kBlockM_div_H, kBlockN);        
 
-        if constexpr(Is_causal) {
+        if (is_causal) {
             CUTLASS_PRAGMA_UNROLL
             for (int iter = 0; iter < extra_iterations && n_block >= n_block_min; ++iter, --n_block) {
                 Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));

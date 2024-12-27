@@ -49,7 +49,8 @@ void set_params_fprop(Flash_fwd_params &params,
                       bool unpadded_lse=false,
                       // device pointers only used for flex flash attention
                       void *q_ranges_d=nullptr,
-                      void *k_ranges_d=nullptr) {
+                      void *k_ranges_d=nullptr,
+                      void *is_causal_mapping_d=nullptr) {
 
     // Reset the parameters
     params = {};
@@ -88,6 +89,7 @@ void set_params_fprop(Flash_fwd_params &params,
     params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
     params.q_ranges = static_cast<int *>(q_ranges_d);
     params.k_ranges = static_cast<int *>(k_ranges_d);
+    params.is_causal_mapping = static_cast<bool *>(is_causal_mapping_d);
     params.seqused_q = static_cast<int *>(seqused_q);
     params.seqused_k = static_cast<int *>(seqused_k);
 
@@ -1575,6 +1577,7 @@ flex_flash_fwd(
     c10::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
     const at::Tensor &q_ranges, // b x 2, q_ranges[i] = [start_i, end_i]
     const at::Tensor &k_ranges, // b x 2, k_ranges[i] = [start_i, end_i]
+    const at::Tensor &is_causal_mapping, // b, is_causal_mapping[i] = true if the i-th sequence is causal
     const int max_seqlen_q,
     const int max_seqlen_k,
     const float softmax_scale,
@@ -1594,11 +1597,12 @@ flex_flash_fwd(
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
     CHECK_DEVICE(q_ranges); CHECK_DEVICE(k_ranges);
-
+    CHECK_DEVICE(is_causal_mapping);
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     CHECK_CONTIGUOUS(q_ranges); CHECK_CONTIGUOUS(k_ranges);
+    CHECK_CONTIGUOUS(is_causal_mapping);
 
     const auto sizes = q.sizes();
 
@@ -1609,7 +1613,7 @@ flex_flash_fwd(
 
     void *q_ranges_d = q_ranges.data_ptr();
     void *k_ranges_d = k_ranges.data_ptr();
-
+    void *is_causal_mapping_d = is_causal_mapping.data_ptr();
     const int total_q = q.sizes()[0];
 
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
@@ -1623,6 +1627,7 @@ flex_flash_fwd(
 
     CHECK_SHAPE(q_ranges, batch_size, 2);
     CHECK_SHAPE(k_ranges, batch_size, 2);
+    CHECK_SHAPE(is_causal_mapping, batch_size);
 
     at::Tensor q_padded, k_padded, v_padded;
     if (head_size_og % 8 != 0) {
@@ -1681,7 +1686,8 @@ flex_flash_fwd(
                      /*seqlenq_ngroups_swapped=*/false,
                      /*unpadded_lse=*/true,
                      /*q_ranges_d=*/q_ranges_d,
-                     /*k_ranges_d=*/k_ranges_d);
+                     /*k_ranges_d=*/k_ranges_d,
+                     /*is_causal_mapping_d=*/is_causal_mapping_d);
     params.total_q = total_q;
     params.total_k = total_k;
 

@@ -164,7 +164,7 @@ def _flash_attn_varlen_backward(
     return dq, dk, dv, softmax_d
 
 
-def _flex_flash_attn_forward(q, k, v, q_ranges, k_ranges, max_seqlen_q, max_seqlen_k, softmax_scale, deterministic):
+def _flex_flash_attn_forward(q, k, v, q_ranges, k_ranges, is_causal_mapping, max_seqlen_q, max_seqlen_k, softmax_scale, deterministic):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, q, k, v, out_padded, softmax_lse = flashattn_hopper_cuda.flex_flash_fwd(
@@ -174,6 +174,7 @@ def _flex_flash_attn_forward(q, k, v, q_ranges, k_ranges, max_seqlen_q, max_seql
         None,
         q_ranges,
         k_ranges,
+        is_causal_mapping,
         max_seqlen_q,
         max_seqlen_k, 
         softmax_scale,
@@ -382,13 +383,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
 class FlexFlashAttnFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, q_ranges, k_ranges, max_seqlen_q, max_seqlen_k, softmax_scale, deterministic):
+    def forward(ctx, q, k, v, q_ranges, k_ranges, is_causal_mapping, max_seqlen_q, max_seqlen_k, softmax_scale, deterministic):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         out, q, k, v, out_padded, softmax_lse = _flex_flash_attn_forward(
-            q, k, v, q_ranges, k_ranges, max_seqlen_q, max_seqlen_k, softmax_scale, deterministic
+            q, k, v, q_ranges, k_ranges, is_causal_mapping, max_seqlen_q, max_seqlen_k, softmax_scale, deterministic
         )
-        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, q_ranges, k_ranges)
+        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, q_ranges, k_ranges, is_causal_mapping)
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
         ctx.softmax_scale = softmax_scale
@@ -589,6 +590,7 @@ def flex_flash_attn_func(
     v,
     q_ranges,
     k_ranges,
+    is_causal_mapping,
     max_seqlen_q,
     max_seqlen_k,
     softmax_scale=None,
@@ -626,6 +628,7 @@ def flex_flash_attn_func(
         v,
         q_ranges,
         k_ranges,
+        is_causal_mapping,
         max_seqlen_q,
         max_seqlen_k,
         softmax_scale,

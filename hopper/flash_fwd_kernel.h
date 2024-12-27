@@ -26,7 +26,7 @@ using namespace cute;
 
 template <typename Ktraits, bool Is_causal, bool Is_local, typename TileScheduler, typename Seqlen_traits, typename Seqlen_traits_Q = Seqlen_traits>
 __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp, 1)
-    compute_attn_ws(CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_causal, Is_local, Seqlen_traits, Seqlen_traits_Q>::Params const mainloop_params,
+    compute_attn_ws(CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_local, Seqlen_traits, Seqlen_traits_Q>::Params const mainloop_params,
                     CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<Ktraits, Seqlen_traits_Q>::Params const epilogue_params,
                     CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params,
                     Seqlen_traits_Q seqlen_traits_q, Seqlen_traits seqlen_traits_k
@@ -47,7 +47,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     // static constexpr int kBlockN = Ktraits::kBlockN;
     // static constexpr int kHeadDim = Ktraits::kHeadDim;
 
-    using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal, Is_local, Seqlen_traits, Seqlen_traits_Q>;
+    using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_local, Seqlen_traits, Seqlen_traits_Q>;
     using CollectiveEpilogue = CollectiveEpilogueFwd<Ktraits, Seqlen_traits_Q>;
 
     using MainloopPipeline = typename Ktraits::MainloopPipeline;
@@ -116,6 +116,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 auto block_coord = work_tile_info.get_block_coord(scheduler_params);
                 auto [m_block, n_split_idx, bidh, bidb] = block_coord;
 
+                bool is_causal = mainloop_params.is_causal_mapping != nullptr 
+                    ? mainloop_params.is_causal_mapping[bidb] 
+                    : Is_causal;
+
                 seqlen_traits_q.init(bidb);
                 seqlen_traits_k.init(bidb);
 
@@ -128,7 +132,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 int n_block_min = 0, n_block_max;
                 collective_mainloop.get_n_block_min_max(
                         mainloop_params, m_block, n_split_idx, seqlen_traits_q, seqlen_traits_k,
-                        n_block_min, n_block_max);
+                        n_block_min, n_block_max, is_causal);
                 if constexpr (Is_causal || Is_local || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
                     if(n_block_max <= n_block_min) {
                         scheduler.prefetch_next_work(scheduler_params, work_tile_info);
@@ -170,6 +174,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, n_split_idx, bidh, bidb] = block_coord;
 
+            bool is_causal = mainloop_params.is_causal_mapping != nullptr 
+                ? mainloop_params.is_causal_mapping[bidb] 
+                : Is_causal;
+
             seqlen_traits_q.init(bidb);
             seqlen_traits_k.init(bidb);
             // printf("m_block = %d, n_split_idx = %d, bidh = %d, bidb = %d\n", m_block, n_split_idx, bidh, bidb);
@@ -183,7 +191,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             int n_block_max, n_block_min = 0;
             collective_mainloop.get_n_block_min_max(
                     mainloop_params, m_block, n_split_idx, seqlen_traits_q, seqlen_traits_k,
-                    n_block_min, n_block_max);
+                    n_block_min, n_block_max, is_causal);
             if constexpr (Is_causal || Is_local || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
                 if(n_block_max <= n_block_min) {  // We exit early and write 0 to gO and -inf to gLSE.
                     if constexpr(!Seqlen_traits_Q::UseGQAPacking) {
@@ -200,7 +208,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             collective_mainloop.mma(
                 mainloop_params, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
                 tOrO, softmax, n_block_min, n_block_max, threadIdx.x - NumCopyThreads, work_idx,
-                m_block, shared_storage, seqlen_traits_q, seqlen_traits_k);
+                m_block, shared_storage, seqlen_traits_q, seqlen_traits_k, is_causal);
                 // tOrO, softmax, n_block_max, threadIdx.x - NumCopyThreads + (work_idx >> 30), work_idx, shared_storage);
             collective_epilogue.store(
                 epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
@@ -215,7 +223,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
 template <typename Ktraits, bool Is_causal, bool Is_local, typename TileScheduler, typename Seqlen_traits, typename Seqlen_traits_Q = Seqlen_traits>
 __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp, 1)
-    compute_attn_ws_fp8(CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_causal, Is_local, Seqlen_traits, Seqlen_traits_Q>::Params const mainloop_params,
+    compute_attn_ws_fp8(CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_local, Seqlen_traits, Seqlen_traits_Q>::Params const mainloop_params,
                         CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<Ktraits, Seqlen_traits_Q>::Params const epilogue_params,
                         CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params,
                         Seqlen_traits_Q seqlen_traits_q, Seqlen_traits seqlen_traits_k
@@ -239,7 +247,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     static constexpr bool Delay_V_release = Is_causal && Ktraits::kHeadDim == 128 && Ktraits::kNWarps != 8;    
     static constexpr bool Use_max_offset = true;
 
-    using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal, Is_local, Seqlen_traits, Seqlen_traits_Q>;
+    using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_local, Seqlen_traits, Seqlen_traits_Q>;
     using CollectiveEpilogue = CollectiveEpilogueFwd<Ktraits, Seqlen_traits_Q>;
 
     using MainloopPipeline = typename Ktraits::MainloopPipeline;
@@ -323,6 +331,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, n_split_idx, bidh, bidb] = block_coord;
 
+            bool is_causal = mainloop_params.is_causal_mapping != nullptr 
+                ? mainloop_params.is_causal_mapping[bidb] 
+                : Is_causal;
+
             if constexpr (seqlen_traits_q.UseVarSeqLen) { seqlen_traits_q.init(bidb); }
             if (shared_storage.seqlen_init_k) { seqlen_traits_k.init_no_guard(bidb); }
             if constexpr(seqlen_traits_q.UseVarSeqLen) {
@@ -334,7 +346,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             int n_block_min = 0, n_block_max;
             collective_mainloop.get_n_block_min_max(
                     mainloop_params, m_block, n_split_idx, seqlen_traits_q, seqlen_traits_k,
-                    n_block_min, n_block_max);
+                    n_block_min, n_block_max, is_causal);
             if constexpr (Is_causal || Is_local ||seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
                 if(n_block_max <= n_block_min) {
                     scheduler.prefetch_next_work(scheduler_params, work_tile_info);
@@ -379,6 +391,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, n_split_idx, bidh, bidb] = block_coord;
 
+            bool is_causal = mainloop_params.is_causal_mapping != nullptr 
+                ? mainloop_params.is_causal_mapping[bidb] 
+                : Is_causal;
+
             if constexpr (seqlen_traits_q.UseVarSeqLen) { seqlen_traits_q.init(bidb); }
             if (shared_storage.seqlen_init_k) { seqlen_traits_k.init_no_guard(bidb); }
             if constexpr(seqlen_traits_q.UseVarSeqLen) {
@@ -390,7 +406,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             int n_block_max, n_block_min = 0;
             collective_mainloop.get_n_block_min_max(
                     mainloop_params, m_block, n_split_idx, seqlen_traits_q, seqlen_traits_k,
-                    n_block_min, n_block_max);
+                    n_block_min, n_block_max, is_causal);
             if constexpr (Is_causal || Is_local || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
                 if(n_block_max <= n_block_min) {  // We exit early and write 0 to gO and -inf to gLSE.
                     if constexpr(!Seqlen_traits_Q::UseGQAPacking) {
@@ -407,7 +423,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             collective_mainloop.mma_fp8<Delay_V_release>(
                 mainloop_params, pipeline_k, pipeline_vt, smem_pipe_read, smem_pipe_release,
                 tOrO, softmax, n_block_min, n_block_max, threadIdx.x - NumCopyThreads, work_idx, m_block,
-                shared_storage, seqlen_traits_q, seqlen_traits_k);
+                shared_storage, seqlen_traits_q, seqlen_traits_k, is_causal);
 
             collective_epilogue.store(
                 epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,

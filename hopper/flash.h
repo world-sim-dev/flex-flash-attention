@@ -144,6 +144,10 @@ struct Flash_fwd_params : public Qkv_params {
     bool unpadded_lse; // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
 
+    // For varlen paths: is_causal_mapping[bidb] = true if the causal mask is applied to the b-th sequence.
+    // If not provided, we use the is_causal flag.
+    bool * __restrict__ is_causal_mapping; 
+
     int * __restrict__ tile_count_semaphore;
     float * __restrict__ descale_q_ptr;
     float * __restrict__ descale_k_ptr;

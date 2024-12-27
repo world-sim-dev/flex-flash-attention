@@ -31,7 +31,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(Seqlen_traits_Q::UseGQAPacking == (Kernel_traits::kBlockH > 1), "If kBlockH > 1, use gqa packed layouts");
     static_assert(!(Is_split && Seqlen_traits::UseVarSeqLen), "Split KV not yet supported for variable seqlen.");
 
-    using CollectiveMainloop = flash::CollectiveMainloopFwd<Kernel_traits, Is_causal, Is_local, Seqlen_traits, Seqlen_traits_Q>;
+    using CollectiveMainloop = flash::CollectiveMainloopFwd<Kernel_traits, Is_local, Seqlen_traits, Seqlen_traits_Q>;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<Kernel_traits, Seqlen_traits_Q>;
     using Scheduler = std::conditional_t<
         Seqlen_traits::UseVarSeqLen, 
@@ -75,7 +75,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             params.window_size_right,
             ceil_div(params.h_h_k_ratio, Kernel_traits::kBlockH),
             params.cache_batch_idx,
-            Is_split ? params.num_splits : 1
+            Is_split ? params.num_splits : 1,
+            params.is_causal_mapping,
         });
     typename CollectiveEpilogue::Params epilogue_params = [&] {
         if constexpr(!Is_split) {
