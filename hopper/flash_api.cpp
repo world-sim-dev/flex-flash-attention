@@ -147,13 +147,21 @@ void set_params_fprop(Flash_fwd_params &params,
     params.window_size_left = window_size_left;
     params.window_size_right = window_size_right;
 
-    params.is_causal = window_size_left == int(seqlen_k) && window_size_right == 0;
-    if ((window_size_left < int(seqlen_k) || window_size_right < int(seqlen_k)) && !params.is_causal) {
+    // If is_causal_all is true, it means this is non-flex flash attention
+    params.is_causal_all = window_size_left == int(seqlen_k) && window_size_right == 0;
+    if (params.is_causal_mapping != nullptr) {
+        TORCH_CHECK(!params.is_causal_all, "is_causal_all should be false for flex flash attention");
+    }
+    else {
+        // TODO(xiaowu): When is_causal_mapping is all true, we need to set is_causal_all to true
+    }
+
+    if ((window_size_left < int(seqlen_k) || window_size_right < int(seqlen_k)) && !params.is_causal_all) {
         params.is_local = true;
     }
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
-        TORCH_CHECK(params.is_causal || (window_size_left < 0 && window_size_right < 0),
+        TORCH_CHECK(params.is_causal_all || (window_size_left < 0 && window_size_right < 0),
             "This flash attention build does not support local attention.");
     #endif
 
@@ -200,7 +208,8 @@ void set_params_dgrad(Flash_bwd_params &params,
                       int window_size_right,
                       bool deterministic,
                       void *q_ranges_d,
-                      void *k_ranges_d) {
+                      void *k_ranges_d,
+                      void *is_causal_mapping_d=nullptr) {
 
     set_params_fprop(params,
                      b, b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
@@ -217,7 +226,8 @@ void set_params_dgrad(Flash_bwd_params &params,
                      window_size_right,
                      false, false,
                      q_ranges_d,
-                     k_ranges_d);
+                     k_ranges_d,
+                     is_causal_mapping_d);
 
     // Set the pointers and strides.
     params.do_ptr = dout.data_ptr();
@@ -1722,6 +1732,7 @@ flex_flash_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
                c10::optional<at::Tensor> &dv_,   // batch_size x seqlen_k x num_heads_k x head_size
                const at::Tensor &q_ranges, // b x 2, q_ranges[i] = [start_i, end_i]
                const at::Tensor &k_ranges, // b x 2, k_ranges[i] = [start_i, end_i]
+               const at::Tensor &is_causal_mapping, // b, is_causal_mapping[i] = true if the i-th sequence is causal
                const int max_seqlen_q,
                const int max_seqlen_k,          // max sequence length to choose the kernel
                const float softmax_scale,
@@ -1748,14 +1759,14 @@ flex_flash_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
     CHECK_DEVICE(out); CHECK_DEVICE(dout); CHECK_DEVICE(softmax_lse);
-    CHECK_DEVICE(q_ranges); CHECK_DEVICE(k_ranges);
+    CHECK_DEVICE(q_ranges); CHECK_DEVICE(k_ranges); CHECK_DEVICE(is_causal_mapping);
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(out.stride(-1) == 1, "out tensor must have contiguous last dimension");
     TORCH_CHECK(dout.stride(-1) == 1, "dout tensor must have contiguous last dimension");
-    CHECK_CONTIGUOUS(q_ranges); CHECK_CONTIGUOUS(k_ranges);
+    CHECK_CONTIGUOUS(q_ranges); CHECK_CONTIGUOUS(k_ranges); CHECK_CONTIGUOUS(is_causal_mapping);
 
     const auto sizes = q.sizes();
 
@@ -1788,9 +1799,11 @@ flex_flash_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
     CHECK_SHAPE(dout, total_q, num_heads, head_size_og);
     CHECK_SHAPE(q_ranges, batch_size, 2);
     CHECK_SHAPE(k_ranges, batch_size, 2);
+    CHECK_SHAPE(is_causal_mapping, batch_size);
 
     void *q_ranges_d = q_ranges.data_ptr();
     void *k_ranges_d = k_ranges.data_ptr();
+    void *is_causal_mapping_d = is_causal_mapping.data_ptr();
 
     at::Tensor dq, dk, dv;
     if (dq_.has_value()) {
@@ -1878,7 +1891,8 @@ flex_flash_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
                      /*window_size_right=*/-1,
                      deterministic,
                      q_ranges_d,
-                     k_ranges_d);
+                     k_ranges_d,
+                     is_causal_mapping_d);
 
     params.total_q = total_q;
     params.total_k = total_k;

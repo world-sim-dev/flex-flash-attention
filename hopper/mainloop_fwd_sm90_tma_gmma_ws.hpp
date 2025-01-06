@@ -169,7 +169,7 @@ struct CollectiveMainloopFwd {
         int const qhead_per_khead;
         int const* cache_batch_idx;
         int const num_splits;
-        bool * is_causal_mapping;
+        bool const* is_causal_mapping;
     };
 
     // Device side kernel params
@@ -189,7 +189,7 @@ struct CollectiveMainloopFwd {
         int window_size_right;
         int const* cache_batch_idx;
         cutlass::FastDivmod num_splits_divmod;
-        bool * is_causal_mapping;
+        bool const* is_causal_mapping;
     };
 
 
@@ -264,7 +264,7 @@ struct CollectiveMainloopFwd {
             n_block_max = std::min(
                 n_block_max,
                 cute::ceil_div((m_block + 1) * kBlockM_div_H + seqlen_k - seqlen_q, kBlockN));
-        } else if constexpr (Is_local) {
+        } else if (Is_local) {
             n_block_max = std::min(
                 n_block_max,
                 cute::ceil_div((m_block + 1) * kBlockM_div_H + seqlen_k - seqlen_q + mainloop_params.window_size_right, kBlockN));

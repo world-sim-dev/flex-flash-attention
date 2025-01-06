@@ -24,7 +24,7 @@ namespace flash {
 
 using namespace cute;
 
-template <typename Ktraits, bool Is_causal, bool Is_local, typename TileScheduler, typename Seqlen_traits, typename Seqlen_traits_Q = Seqlen_traits>
+template <typename Ktraits, bool Is_causal_all, bool Is_local, typename TileScheduler, typename Seqlen_traits, typename Seqlen_traits_Q = Seqlen_traits>
 __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp, 1)
     compute_attn_ws(CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_local, Seqlen_traits, Seqlen_traits_Q>::Params const mainloop_params,
                     CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<Ktraits, Seqlen_traits_Q>::Params const epilogue_params,
@@ -118,7 +118,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
                 bool is_causal = mainloop_params.is_causal_mapping != nullptr 
                     ? mainloop_params.is_causal_mapping[bidb] 
-                    : Is_causal;
+                    : Is_causal_all;
 
                 seqlen_traits_q.init(bidb);
                 seqlen_traits_k.init(bidb);
@@ -133,7 +133,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 collective_mainloop.get_n_block_min_max(
                         mainloop_params, m_block, n_split_idx, seqlen_traits_q, seqlen_traits_k,
                         n_block_min, n_block_max, is_causal);
-                if constexpr (Is_causal || Is_local || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
+                if constexpr (Is_causal_all || Is_local || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
                     if(n_block_max <= n_block_min) {
                         scheduler.prefetch_next_work(scheduler_params, work_tile_info);
                         scheduler.broadcast_next_work(work_tile_info);
@@ -176,7 +176,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
             bool is_causal = mainloop_params.is_causal_mapping != nullptr 
                 ? mainloop_params.is_causal_mapping[bidb] 
-                : Is_causal;
+                : Is_causal_all;
 
             seqlen_traits_q.init(bidb);
             seqlen_traits_k.init(bidb);
@@ -192,7 +192,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             collective_mainloop.get_n_block_min_max(
                     mainloop_params, m_block, n_split_idx, seqlen_traits_q, seqlen_traits_k,
                     n_block_min, n_block_max, is_causal);
-            if constexpr (Is_causal || Is_local || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
+            if constexpr (Is_causal_all || Is_local || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
                 if(n_block_max <= n_block_min) {  // We exit early and write 0 to gO and -inf to gLSE.
                     if constexpr(!Seqlen_traits_Q::UseGQAPacking) {
                         collective_epilogue.store_zero(epilogue_params, shared_storage, threadIdx.x - NumCopyThreads,
@@ -221,7 +221,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
 }
 
-template <typename Ktraits, bool Is_causal, bool Is_local, typename TileScheduler, typename Seqlen_traits, typename Seqlen_traits_Q = Seqlen_traits>
+template <typename Ktraits, bool Is_causal_all, bool Is_local, typename TileScheduler, typename Seqlen_traits, typename Seqlen_traits_Q = Seqlen_traits>
 __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp, 1)
     compute_attn_ws_fp8(CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_local, Seqlen_traits, Seqlen_traits_Q>::Params const mainloop_params,
                         CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<Ktraits, Seqlen_traits_Q>::Params const epilogue_params,
@@ -244,7 +244,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     static constexpr int kBlockH = Ktraits::kBlockH;
     // static constexpr int kBlockN = Ktraits::kBlockN;
     // static constexpr int kHeadDim = Ktraits::kHeadDim;
-    static constexpr bool Delay_V_release = Is_causal && Ktraits::kHeadDim == 128 && Ktraits::kNWarps != 8;    
+    // REVIEW(xiaowu): Is Is_causal_all correct?
+    static constexpr bool Delay_V_release = Is_causal_all && Ktraits::kHeadDim == 128 && Ktraits::kNWarps != 8;
     static constexpr bool Use_max_offset = true;
 
     using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_local, Seqlen_traits, Seqlen_traits_Q>;
@@ -333,7 +334,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
             bool is_causal = mainloop_params.is_causal_mapping != nullptr 
                 ? mainloop_params.is_causal_mapping[bidb] 
-                : Is_causal;
+                : Is_causal_all;
 
             if constexpr (seqlen_traits_q.UseVarSeqLen) { seqlen_traits_q.init(bidb); }
             if (shared_storage.seqlen_init_k) { seqlen_traits_k.init_no_guard(bidb); }
@@ -347,7 +348,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             collective_mainloop.get_n_block_min_max(
                     mainloop_params, m_block, n_split_idx, seqlen_traits_q, seqlen_traits_k,
                     n_block_min, n_block_max, is_causal);
-            if constexpr (Is_causal || Is_local ||seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
+            if constexpr (Is_causal_all || Is_local || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
                 if(n_block_max <= n_block_min) {
                     scheduler.prefetch_next_work(scheduler_params, work_tile_info);
                     scheduler.broadcast_next_work(work_tile_info);
@@ -362,7 +363,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 seqlen_traits_q, seqlen_traits_k, n_block_min, n_block_max);
             ++work_idx;
             // don't need to sync producer warpgroup here
-            // if constexpr (Is_causal) {
+            // if constexpr (is_causal) {
             //     cutlass::arch::NamedBarrier::sync(NumCopyThreads, static_cast<int>(FwdNamedBarriers::ProducerWG) /*id*/); }
         }
         collective_mainloop.load_tail_one_write(pipeline_k, pipeline_v, smem_pipe_write);
@@ -393,7 +394,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
             bool is_causal = mainloop_params.is_causal_mapping != nullptr 
                 ? mainloop_params.is_causal_mapping[bidb] 
-                : Is_causal;
+                : Is_causal_all;
 
             if constexpr (seqlen_traits_q.UseVarSeqLen) { seqlen_traits_q.init(bidb); }
             if (shared_storage.seqlen_init_k) { seqlen_traits_k.init_no_guard(bidb); }
@@ -407,7 +408,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             collective_mainloop.get_n_block_min_max(
                     mainloop_params, m_block, n_split_idx, seqlen_traits_q, seqlen_traits_k,
                     n_block_min, n_block_max, is_causal);
-            if constexpr (Is_causal || Is_local || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
+            if constexpr (Is_causal_all || Is_local || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
                 if(n_block_max <= n_block_min) {  // We exit early and write 0 to gO and -inf to gLSE.
                     if constexpr(!Seqlen_traits_Q::UseGQAPacking) {
                         collective_epilogue.store_zero(epilogue_params, shared_storage, threadIdx.x - NumCopyThreads,

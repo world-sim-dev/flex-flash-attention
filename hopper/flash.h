@@ -129,7 +129,8 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool is_bf16;
     bool is_e4m3;
-    bool is_causal;
+    bool is_causal_all;
+    bool is_causal_any; // not used currently
     bool is_local;
     bool is_kv_cache;
     bool use_gqa_packing;
@@ -145,7 +146,7 @@ struct Flash_fwd_params : public Qkv_params {
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
 
     // For varlen paths: is_causal_mapping[bidb] = true if the causal mask is applied to the b-th sequence.
-    // If not provided, we use the is_causal flag.
+    // If not provided, we use the is_causal_all flag.
     bool * __restrict__ is_causal_mapping; 
 
     int * __restrict__ tile_count_semaphore;

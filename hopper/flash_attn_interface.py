@@ -195,6 +195,7 @@ def _flex_flash_attn_backward(
     dv,
     q_ranges,
     k_ranges,
+    is_causal_mapping,
     max_seqlen_q,
     max_seqlen_k,
     softmax_scale,
@@ -221,6 +222,7 @@ def _flex_flash_attn_backward(
         dv,
         q_ranges,
         k_ranges,
+        is_causal_mapping,
         max_seqlen_q,
         max_seqlen_k,
         softmax_scale,
@@ -398,7 +400,7 @@ class FlexFlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, q_ranges, k_ranges = ctx.saved_tensors
+        q, k, v, out, softmax_lse, q_ranges, k_ranges, is_causal_mapping = ctx.saved_tensors
         
         # Because we're using TMA reduce add for dk and dv, we need to pad the 
         # batch size to a multiple of 128
@@ -422,6 +424,7 @@ class FlexFlashAttnFunc(torch.autograd.Function):
             dv,
             q_ranges,
             k_ranges,
+            is_causal_mapping,
             ctx.max_seqlen_q,
             ctx.max_seqlen_k,
             ctx.softmax_scale,
@@ -430,7 +433,7 @@ class FlexFlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None
 
 
 def flash_attn_func(
@@ -608,6 +611,7 @@ def flex_flash_attn_func(
             NOTE: Different ranges cannot overlap
         k_ranges: (batch_size, 2), dtype torch.int32. The start and end indices of the keys in the batch.
             NOTE: Different ranges can overlap
+        is_causal_mapping: (batch_size,), dtype torch.bool. Whether the batch is causal.
         max_seqlen_q: int. The maximum sequence length of the queries.
         max_seqlen_k: int. The maximum sequence length of the keys.
         softmax_scale: float. The scaling of QK^T before applying softmax.

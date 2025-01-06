@@ -24,7 +24,7 @@ namespace flash {
 using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, class Element_, class ElementAccum_, class ArchTag_,
-        bool Is_causal_, bool Is_local_, bool Varlen_, bool Deterministic,
+        bool Is_local_, bool Varlen_, bool Deterministic,
         bool dKV_swapAB_, bool dQ_swapAB_,
         int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1>
 struct CollectiveMainloopBwd {
@@ -35,7 +35,6 @@ struct CollectiveMainloopBwd {
     using Element = Element_;
     using ElementAccum = ElementAccum_;
     using ArchTag = ArchTag_;
-    static constexpr bool Is_causal = Is_causal_;
     static constexpr bool Is_local = Is_local_;
     static constexpr bool Varlen = Varlen_;
     static constexpr bool SdP_swapAB = true;
@@ -286,6 +285,7 @@ struct CollectiveMainloopBwd {
         int window_size_right;
         int const* q_ranges = nullptr;
         int const* k_ranges = nullptr;
+        bool const* is_causal_mapping;
     };
 
     // Device side kernel params
@@ -315,7 +315,8 @@ struct CollectiveMainloopBwd {
         int window_size_left;
         int window_size_right;
         int const* q_ranges = nullptr;
-        int const* k_ranges = nullptr;  
+        int const* k_ranges = nullptr;
+        bool const* is_causal_mapping;
     };
 
     static Params
@@ -376,7 +377,8 @@ struct CollectiveMainloopBwd {
                 args.ptr_LSE_log2, args.shape_LSE, args.stride_LSE_log2, args.ptr_dPsum, args.stride_dPsum,
                 args.softmax_scale, float(args.softmax_scale * M_LOG2E),
                 args.num_batch, args.dq_semaphore, args.cu_seqlens_q, args.cu_seqlens_k,
-                args.seqused_k, args.seqused_v, args.window_size_left, args.window_size_right, args.q_ranges, args.k_ranges};
+                args.seqused_k, args.seqused_v, args.window_size_left, args.window_size_right, args.q_ranges, args.k_ranges,
+                args.is_causal_mapping};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -430,13 +432,18 @@ struct CollectiveMainloopBwd {
     }
 
     CUTLASS_DEVICE
-    int get_m_block_min(Params const& params, int n_block, int bidb) {
+    int get_m_block_min(Params const& params, int n_block, int bidb, bool is_causal) {
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});        
-        if constexpr (Is_causal || Is_local) {
+        if (is_causal || Is_local) {
             int const seqlen_q = get_seqlen_q(params, bidb);
             int const seqlen_k = get_seqlen_k(params, bidb);
-            return std::max(0, (n_block * kBlockN + seqlen_q - seqlen_k - params.window_size_right) / kBlockM);
+            if (is_causal) {
+                return std::max(0, (n_block * kBlockN + seqlen_q - seqlen_k) / kBlockM);
+            }
+            else{
+                return std::max(0, (n_block * kBlockN + seqlen_q - seqlen_k - params.window_size_right) / kBlockM);
+            }
         } else {
             return 0;
         }
@@ -477,6 +484,7 @@ struct CollectiveMainloopBwd {
 
         auto [n_block, bidh, bidb] = block_coord;
         int bidh_kv = params.qhead_per_khead_divmod.divide(bidh);
+        bool const is_causal = params.is_causal_mapping != nullptr ? params.is_causal_mapping[bidb] : false;
 
         // Prepare the TMA loads
         uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
@@ -543,7 +551,7 @@ struct CollectiveMainloopBwd {
         }
 
         int m_block_max = get_m_block_max(params, n_block, bidb);
-        int m_block_min = get_m_block_min(params, n_block, bidb);
+        int m_block_min = get_m_block_min(params, n_block, bidb, is_causal);
         int m_block = m_block_min;
 
         int lane_predicate = cute::elect_one_sync();
@@ -608,6 +616,7 @@ struct CollectiveMainloopBwd {
         Tensor sdQ = make_tensor(make_smem_ptr(shared_storage.mainloop.smem_dqacc.data()), SmemLayoutdQaccumTMA{});
         Tensor sdQnoswizzle = make_tensor(make_smem_ptr(shared_storage.mainloop.smem_dqacc.data()), SmemLayoutdQaccumTMANoSwizzle{});
         auto [n_block, bidh, bidb] = block_coord;
+        bool const is_causal = params.is_causal_mapping != nullptr ? params.is_causal_mapping[bidb] : false;
 
         bool const is_flex_q = Varlen && params.q_ranges != nullptr;
         bool const is_varlen_q = (Varlen && params.cu_seqlens_q != nullptr) || is_flex_q;
@@ -628,7 +637,7 @@ struct CollectiveMainloopBwd {
         Tensor tdQsdQ = block_tma_dQ.partition_S(sdQ); // (TMA, TMA_M, TMA_K)
 
         int m_block_max = get_m_block_max(params, n_block, bidb);
-        int m_block_min = get_m_block_min(params, n_block, bidb);
+        int m_block_min = get_m_block_min(params, n_block, bidb, is_causal);
         int m_block = m_block_min;
         int const num_batch = params.num_batch;
         int const num_head = get<2>(params.shape_Q);
@@ -683,7 +692,8 @@ struct CollectiveMainloopBwd {
         int thread_idx,
         int work_idx,
         cute::tuple<int32_t, int32_t, int32_t> block_coord,
-        SharedStorage& shared_storage
+        SharedStorage& shared_storage,
+        bool is_causal
         ) {
         static_assert(is_rmem<FrgTensordKV>::value, "dK and dV tensor must be rmem resident.");
 
@@ -747,7 +757,7 @@ struct CollectiveMainloopBwd {
         int const seqlen_k = get_seqlen_k(params, bidb);
 
         int m_block_max = get_m_block_max(params, n_block, bidb);
-        int m_block_min = get_m_block_min(params, n_block, bidb);
+        int m_block_min = get_m_block_min(params, n_block, bidb, is_causal);
         int m_block = m_block_min;
 
         // thread_mma_SdP.partition_C(sLSEMma) has shape ((2, 2, V), MMA_M, MMA_N, PIPE), we only take the row indices.
@@ -792,7 +802,7 @@ struct CollectiveMainloopBwd {
 
         // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
         // this helps quite a bit to not have to do causal masking for most of the iterations.
-        if constexpr (Is_causal) {
+        if (is_causal) {
             static constexpr int n_masking_steps = cute::ceil_div(kBlockN, kBlockM) + 1;
             CUTLASS_PRAGMA_NO_UNROLL
             for (; m_block < std::min(m_block_max, m_block_min + n_masking_steps); ++m_block) {
@@ -874,7 +884,13 @@ struct CollectiveMainloopBwd {
                     if (int(get<0>(taccScS(i))) >= int(seqlen_k - n_block * kBlockN)) { tSrS(i) = -INFINITY; }
                 }
             } else {
-                int local_row_offset_right = 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM + params.window_size_right;
+                int local_row_offset_right;
+                if (is_causal) {
+                    local_row_offset_right = 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM;
+                }
+                else{
+                    local_row_offset_right = 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM + params.window_size_right;
+                }
                 int local_row_offset_left = seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM - params.window_size_left;
                 #pragma unroll
                 for (int i = 0; i < size(tSrS); ++i) {

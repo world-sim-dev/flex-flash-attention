@@ -30,7 +30,6 @@ class FlashAttnBwd {
 public:
 
     // Type Aliases
-    static constexpr bool Is_causal = CollectiveMainloop_::Is_causal;
     static constexpr bool Is_local = CollectiveMainloop_::Is_local;
     static_assert(CollectiveMainloop_::Varlen == CollectiveEpilogue_::Varlen);
     static constexpr bool Varlen = CollectiveMainloop_::Varlen;
@@ -219,14 +218,16 @@ public:
                      work_tile_info = scheduler.template get_next_work</*IsProducer=*/true>(params.scheduler, work_tile_info)) {
                     auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                     auto [n_block, bidh, bidb] = block_coord;
+                    bool const is_causal = params.mainloop.is_causal_mapping[bidb];
+
                     if constexpr (Varlen) {
                         if (n_block * kBlockN >= collective_mainloop.get_seqlen_k(params.mainloop, bidb)) {
                             scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                             continue;
                         }
                     }
-                    if constexpr (Is_causal || Is_local) {
-                        int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb);
+                    if (is_causal || Is_local) {
+                        int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb, is_causal);
                         int const m_block_max = collective_mainloop.get_m_block_max(params.mainloop, n_block, bidb);
                         if (m_block_min >= m_block_max) {
                             scheduler.prefetch_next_work(params.scheduler, work_tile_info);
@@ -248,11 +249,12 @@ public:
                      work_tile_info = scheduler.template get_next_work</*IsProducer=*/false>(params.scheduler, work_tile_info)) {
                     auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                     auto [n_block, bidh, bidb] = block_coord;
+                    bool const is_causal = params.mainloop.is_causal_mapping[bidb];
                     if constexpr (Varlen) {
                         if (n_block * kBlockN >= collective_mainloop.get_seqlen_k(params.mainloop, bidb)) { continue; }
                     }
-                    if constexpr (Is_causal) {
-                        int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb);
+                    if (is_causal) {
+                        int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb, is_causal);
                         int const m_block_max = collective_mainloop.get_m_block_max(params.mainloop, n_block, bidb);
                         if (m_block_min >= m_block_max) { continue; }
                     }
@@ -278,11 +280,12 @@ public:
                  work_tile_info = scheduler.template get_next_work</*IsProducer=*/false>(params.scheduler, work_tile_info)) {
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 auto [n_block, bidh, bidb] = block_coord;
+                bool const is_causal = params.mainloop.is_causal_mapping[bidb];
                 if constexpr (Varlen) {
                     if (n_block * kBlockN >= collective_mainloop.get_seqlen_k(params.mainloop, bidb)) { continue; }
                 }
-                if constexpr (Is_causal || Is_local) {
-                    int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb);
+                if (is_causal || Is_local) {
+                    int const m_block_min = collective_mainloop.get_m_block_min(params.mainloop, n_block, bidb, is_causal);
                     int const m_block_max = collective_mainloop.get_m_block_max(params.mainloop, n_block, bidb);
                     if (m_block_min >= m_block_max) {  // We exit early and write 0 to dK and dV
                         collective_epilogue.store_zero(params.epilogue, threadIdx.x - NumCopyThreads, block_coord);
@@ -294,7 +297,7 @@ public:
                 Tensor tdKrdK = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
                 Tensor tdVrdV = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
                 collective_mainloop.mma(params.mainloop, pipeline_q, pipeline_do, smem_pipe_read,
-                                        tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, work_idx, block_coord, shared_storage);
+                                        tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, work_idx, block_coord, shared_storage, is_causal);
                 collective_epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dKV,
                                           threadIdx.x - NumCopyThreads, block_coord);
 
