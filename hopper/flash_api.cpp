@@ -1674,6 +1674,7 @@ flex_flash_fwd(
 
     auto opts = q.options();
     auto softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
+    softmax_lse.fill_(std::numeric_limits<float>::infinity() * -1);
 
     Flash_fwd_params params;
     set_params_fprop(params,
