@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <torch/python.h>
+
 #include <cuda.h>
 #include <vector>
 
@@ -148,6 +150,7 @@ struct Flash_fwd_params : public Qkv_params {
     // For varlen paths: is_causal_mapping[bidb] = true if the causal mask is applied to the b-th sequence.
     // If not provided, we use the is_causal_all flag.
     bool * __restrict__ is_causal_mapping; 
+    at::Tensor is_causal_mapping_tensor;
 
     int * __restrict__ tile_count_semaphore;
     float * __restrict__ descale_q_ptr;

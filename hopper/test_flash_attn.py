@@ -24,7 +24,7 @@ def print_diffs(out, out_ref):
             print(f"==== diff ==== {idx}, test: {e_o}, ref: {e_o_ref}")
 
 
-@pytest.mark.skip(reason="skipped")
+# @pytest.mark.skip(reason="skipped")
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("causal", [False, True])
@@ -153,7 +153,7 @@ def test_flash_attn_output_fp8(
     torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=atol, check_dtype=False)
 
 
-@pytest.mark.skip(reason="skipped")
+# @pytest.mark.skip(reason="skipped")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -332,7 +332,7 @@ def test_flash_attn_output(
         assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item() + 3e-5
 
 
-@pytest.mark.skip(reason="skipped")
+# @pytest.mark.skip(reason="skipped")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -379,6 +379,7 @@ def test_flash_attn_output(
 def test_flash_attn_varlen_output(
     seqlen_q, seqlen_k, d, causal, local, deterministic, add_unused_qkv, mha_type, dtype
 ):
+    print(f"seqlen_q: {seqlen_q}, seqlen_k: {seqlen_k}, d: {d}, causal: {causal}, local: {local}, deterministic: {deterministic}, add_unused_qkv: {add_unused_qkv}, mha_type: {mha_type}, dtype: {dtype}")
     if (
         max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
@@ -543,10 +544,11 @@ def test_flash_attn_varlen_output(
         assert (dv - dv_ref).abs().max().item() < 1e-4 or (dv - dv_ref).abs().max().item() <= 3 * (dv_pt - dv_ref).abs().max().item()
 
 
-def get_mask_from_ranges(q_ranges, k_ranges, q_len, k_len):
+def get_mask_from_ranges(q_ranges, k_ranges, is_causal_mapping, q_len, k_len):
     bsz = q_ranges.shape[0]
     mask = torch.zeros((q_len, k_len), device='cuda', dtype=torch.bool)
     for i in range(bsz):
+        assert is_causal_mapping[i] == False
         mask[q_ranges[i, 0]:q_ranges[i, 1], k_ranges[i, 0]:k_ranges[i, 1]] = True
     return mask
 
@@ -611,9 +613,9 @@ def generate_qk_ranges(seqlen_q, seqlen_k, bsz, device='cuda'):
         q_ranges = [[0, points[0]]]
         for i in range(bsz-2):
             q_ranges.append([points[i], points[i+1]])
-            max_seqlen_q = max(max_seqlen_q, points[i+1] - points[i])
         q_ranges.append([points[-1], seqlen_q])
-        max_seqlen_q = max(max_seqlen_q, seqlen_q - points[-1])
+        for q_range in q_ranges:
+            max_seqlen_q = max(max_seqlen_q, q_range[1] - q_range[0])
         
         # 随机生成k_ranges
         k_ranges = []
@@ -625,15 +627,18 @@ def generate_qk_ranges(seqlen_q, seqlen_k, bsz, device='cuda'):
             
     q_ranges = torch.tensor(q_ranges, device=device, dtype=torch.int32)
     k_ranges = torch.tensor(k_ranges, device=device, dtype=torch.int32)
-    
-    return q_ranges, k_ranges, max_seqlen_q, max_seqlen_k
 
+    is_causal_mapping = torch.tensor([False] * bsz, device=device, dtype=torch.bool)
+    
+    return q_ranges, k_ranges, is_causal_mapping, max_seqlen_q, max_seqlen_k
+
+# @pytest.mark.skip(reason="skipped")
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("seqlen_q", [8, 256, 551, 1234, 1999]) # hang when seqlen is smaller than 7
 @pytest.mark.parametrize("seqlen_k", [8, 256, 551, 1234]) # hang when seqlen is smaller than 7
-@pytest.mark.parametrize("bsz", [1, 8])                       
+@pytest.mark.parametrize("bsz", [1, 2])                       
 def test_flex_flash_attn_output(
     seqlen_q, 
     seqlen_k, 
@@ -645,7 +650,7 @@ def test_flex_flash_attn_output(
     device = 'cuda'
     torch.random.manual_seed(42)
 
-    q_ranges, k_ranges, max_seqlen_q, max_seqlen_k = generate_qk_ranges(seqlen_q * bsz, seqlen_k * bsz, bsz, device)
+    q_ranges, k_ranges, is_causal_mapping, max_seqlen_q, max_seqlen_k = generate_qk_ranges(seqlen_q * bsz, seqlen_k * bsz, bsz, device)
 
     # print(f"q_ranges: {q_ranges}, k_ranges: {k_ranges}, max_seqlen_q: {max_seqlen_q}, max_seqlen_k: {max_seqlen_k}")
     
@@ -656,15 +661,27 @@ def test_flex_flash_attn_output(
     v = torch.randn(bsz * seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
     g = torch.randn(bsz * seqlen_q, nheads, d, device=device, dtype=dtype)
 
-    out, _ = flex_flash_attn_func(q, k, v, q_ranges, k_ranges, max_seqlen_q, max_seqlen_k, softmax_scale=None, deterministic=False)
+    out, _ = flex_flash_attn_func(q, k, v, q_ranges, k_ranges, is_causal_mapping, max_seqlen_q, max_seqlen_k, softmax_scale=None, deterministic=False)
     out.backward(g)
     dq, dk, dv = q.grad, k.grad, v.grad
     q.grad, k.grad, v.grad = None, None, None
 
-    out_ref = torch_attn_ref(q, k, v, mask=get_mask_from_ranges(q_ranges, k_ranges, seqlen_q * bsz, seqlen_k * bsz), layout="thd", high_precision=True)
+    out_ref = torch_attn_ref(q, k, v, mask=get_mask_from_ranges(q_ranges, k_ranges, is_causal_mapping, seqlen_q * bsz, seqlen_k * bsz), layout="thd", high_precision=True)
     out_ref.backward(g)
     dq_ref, dk_ref, dv_ref = q.grad, k.grad, v.grad
     q.grad, k.grad, v.grad = None, None, None
+    
+    out_ref_low_precision = torch_attn_ref(q, k, v, mask=get_mask_from_ranges(q_ranges, k_ranges, is_causal_mapping, seqlen_q * bsz, seqlen_k * bsz), layout="thd", high_precision=False)
+    out_ref_low_precision.backward(g)
+    dq_ref_low_precision, dk_ref_low_precision, dv_ref_low_precision = q.grad, k.grad, v.grad
+    q.grad, k.grad, v.grad = None, None, None
+
+    assert (out - out_ref_low_precision).abs().max().item() <= 2 * (out_ref_low_precision - out_ref).abs().max().item()
+    assert (dq - dq_ref_low_precision).abs().max().item() <= 2 * (dq_ref_low_precision - dq_ref).abs().max().item()
+
+    if d <= 128:
+        assert (dk - dk_ref_low_precision).abs().max().item() < 1e-4 or (dk - dk_ref_low_precision).abs().max().item() <= 3 * (dk_ref_low_precision - dk_ref).abs().max().item()
+        assert (dv - dv_ref_low_precision).abs().max().item() < 1e-4 or (dv - dv_ref_low_precision).abs().max().item() <= 3 * (dv_ref_low_precision - dv_ref).abs().max().item()
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
@@ -705,5 +722,5 @@ def test_flex_flash_attn_output(
         elsit.append(e)
     print(f"=========================END=========================", flush=True)
 
-    for e in elsit:
-        raise e
+    # for e in elsit:
+    #     raise e

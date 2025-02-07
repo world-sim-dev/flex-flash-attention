@@ -151,9 +151,18 @@ void set_params_fprop(Flash_fwd_params &params,
     params.is_causal_all = window_size_left == int(seqlen_k) && window_size_right == 0;
     if (params.is_causal_mapping != nullptr) {
         TORCH_CHECK(!params.is_causal_all, "is_causal_all should be false for flex flash attention");
+        // TODO(xiaowu): 如果is_causal_mapping为全True，则需要将is_causal_all设置为true
     }
     else {
-        // TODO(xiaowu): When is_causal_mapping is all true, we need to set is_causal_all to true
+        auto opt = torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA);
+        if (params.is_causal_all) {
+            params.is_causal_mapping_tensor = torch::ones({b}, opt);
+            params.is_causal_mapping = static_cast<bool *>(params.is_causal_mapping_tensor.data_ptr());
+        }
+        else{
+            params.is_causal_mapping_tensor = torch::zeros({b}, opt);
+            params.is_causal_mapping = static_cast<bool *>(params.is_causal_mapping_tensor.data_ptr());
+        }
     }
 
     if ((window_size_left < int(seqlen_k) || window_size_right < int(seqlen_k)) && !params.is_causal_all) {
